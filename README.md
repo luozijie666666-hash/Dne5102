@@ -1,4 +1,4 @@
-# Dne5102
+# GAMs
 gam_comparison_study.py# Multi-GAM Model Comparison for Biomass GasificationA comprehensive framework for comparing variants of Generalized Additive Models (GAMs) (with/without monotonic constraints) on biomass gasification data, focusing on regression performance, physical consistency, and interpretability.
 Project Overview
 This repository implements a systematic comparison of 10 variants of Generalized Additive Models (5 base GAM models × 2 versions: standard/monotonic constrained) for regression tasks on biomass gasification datasets. The core goals include:
