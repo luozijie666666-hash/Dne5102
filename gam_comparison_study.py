@@ -1,0 +1,1520 @@
+"""
+Multi-GAM Model Comparison Study for Biomass Gasification
+(With and Without Monotonic Constraints + Bayesian Hyperparameter Optimization)
+
+Models Compared (5 base GAM models x 2 versions = 10 model variants):
+1. EBM / EBM_Mono - Explainable Boosting Machine (InterpretML)
+2. pyGAM / pyGAM_Mono - Classical GAM with splines
+3. GA2M / GA2M_Mono - GA^2M with pairwise interactions
+4. NAM / NAM_Mono - Neural Additive Models
+5. GAMM / GAMM_Mono - Generalized Additive Mixed Models
+
+References:
+- Lou et al. (2012). Intelligible Models for Classification and Regression. KDD 2012.
+- Lou et al. (2013). Accurate Intelligible Models with Pairwise Interactions. KDD 2013.
+- Hastie & Tibshirani (1990). Generalized Additive Models. Chapman & Hall.
+- Agarwal et al. (2021). Neural Additive Models. NeurIPS 2021.
+"""
+
+import os
+import random
+import warnings
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Any, Tuple
+from abc import ABC, abstractmethod
+import time
+import joblib
+
+warnings.filterwarnings("ignore")
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import AutoMinorLocator
+from mpl_toolkits.mplot3d import Axes3D
+
+plt.style.use('seaborn-v0_8-whitegrid')
+
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif", "serif"],
+    "font.size": 10,
+    "axes.labelsize": 11,
+    "axes.titlesize": 12,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "legend.title_fontsize": 10,
+    "figure.dpi": 300,
+    "savefig.dpi": 300,
+    "savefig.format": "png",
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.05,
+    "axes.linewidth": 0.8,
+    "axes.edgecolor": "black",
+    "axes.labelcolor": "black",
+    "axes.spines.top": True,
+    "axes.spines.right": True,
+    "axes.unicode_minus": False,
+    "axes.grid": True,
+    "axes.axisbelow": True,
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.3,
+    "grid.color": "#CCCCCC",
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.major.width": 0.8,
+    "ytick.major.width": 0.8,
+    "xtick.minor.width": 0.5,
+    "ytick.minor.width": 0.5,
+    "xtick.major.size": 4,
+    "ytick.major.size": 4,
+    "xtick.minor.size": 2,
+    "ytick.minor.size": 2,
+    "xtick.major.pad": 4,
+    "ytick.major.pad": 4,
+    "lines.linewidth": 1.5,
+    "lines.markersize": 5,
+    "legend.frameon": True,
+    "legend.framealpha": 0.95,
+    "legend.edgecolor": "0.8",
+    "legend.fancybox": False,
+    "legend.borderpad": 0.4,
+    "legend.labelspacing": 0.3,
+    "legend.handlelength": 1.5,
+    "mathtext.fontset": "stix",
+})
+
+COLORS = ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', '#F39B7F', '#8491B4', '#91D1C2', '#DC0000']
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, mean_absolute_percentage_error
+from sklearn.base import BaseEstimator, RegressorMixin
+
+
+class CFG:
+    DATA_PATH = "Data of biomass gasification.xlsx"
+    OUTPUT_DIR = "results_gam_comparison"
+    SHEET_PERCENT = "data of %"
+    SHEET_GY = "data of GY"
+    CAT_FEATURE = "Bed material"
+    BED_MATERIAL_VALUES = ["1", "2", "3", "4"]
+    TARGETS_MAP = {
+        "H2": "H2 [%vol N2 free]",
+        "CO": "CO [%vol N2 free]",
+        "CO2": "CO2 [%vol N2 free]",
+        "CH4": "CH4 [%vol N2 free]",
+        "GY": "GY [Nm3/kg daf]",
+    }
+    N_FOLDS = 5
+    RANDOM_STATE = 42
+    OPTUNA_N_TRIALS = 30
+    OPTUNA_CV_FOLDS = 3
+    USE_BAYESIAN_OPT = False
+
+
+CONTINUOUS_COLS = ["T", "ER", "Steam/Biomass", "C", "H", "O", "Ash", "Moisture"]
+BED_COL = CFG.CAT_FEATURE
+BED_DUMMIES = [f"Bed_{v}" for v in CFG.BED_MATERIAL_VALUES]
+FEATURE_COLUMNS = CONTINUOUS_COLS + BED_DUMMIES
+TARGETS = ["H2", "CO", "CO2", "CH4", "GY"]
+N_CONTINUOUS = len(CONTINUOUS_COLS)
+
+FEATURE_UNITS = {
+    "T": r"$T$ [K]", "ER": r"ER [-]", "Steam/Biomass": r"S/B [-]",
+    "C": r"C [wt%]", "H": r"H [wt%]", "O": r"O [wt%]",
+    "Ash": r"Ash [wt%]", "Moisture": r"Moisture [wt%]",
+}
+
+TARGET_UNITS = {
+    "H2": r"H$_2$ [vol% N$_2$ free]",
+    "CO": r"CO [vol% N$_2$ free]",
+    "CO2": r"CO$_2$ [vol% N$_2$ free]",
+    "CH4": r"CH$_4$ [vol% N$_2$ free]",
+    "GY": r"GY [Nm$^3$/kg daf]",
+}
+
+
+def get_constraints_vector(target: str) -> List[int]:
+    # Index: 0:T, 1:ER, 2:S/B, 3:C, 4:H, 5:O, 6:Ash, 7:MS, 8-11:Bed
+    # Note: S/B (index 2) has no clear physical constraints - set to 0 for all targets
+    # Note: GY has no authoritative physical trend reports - no constraints applied
+    mapping: Dict[str, List[int]] = {
+        "H2":  [ 1, -1, 0, 0, 0, 0, 0,  1, 0, 0, 0, 0],
+        "CO":  [ 1, -1, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0],
+        "CO2": [-1,  1, 0, 0, 0, 0, 0,  1, 0, 0, 0, 0],
+        "CH4": [ 0, -1, 0, 0, 0, 0, 0,  1, 0, 0, 0, 0],
+        "GY":  [ 0,  0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0],
+    }
+    return mapping[target]
+
+
+def check_physical_conformity(model, X: np.ndarray, target: str, n_points: int = 10, tol: float = 1e-6) -> Tuple[float, Dict[str, float]]:
+    constraints_vec = get_constraints_vector(target)
+    X = np.asarray(X)
+    n = X.shape[0]
+    satisfied = np.ones(n, dtype=bool)
+    feature_rates = {}
+    for idx in range(N_CONTINUOUS):
+        sign = constraints_vec[idx]
+        if sign == 0:
+            continue
+        feature_name = CONTINUOUS_COLS[idx]
+        feature_satisfied = np.ones(n, dtype=bool)
+        std_val = max(np.std(X[:, idx]), 1e-9)
+        for delta_factor in np.linspace(1e-4, 1e-2, n_points):
+            delta = delta_factor * std_val
+            X_plus, X_minus = X.copy(), X.copy()
+            X_plus[:, idx] += delta
+            X_minus[:, idx] -= delta
+            grad = (model.predict(X_plus) - model.predict(X_minus)) / (2.0 * delta)
+            if sign > 0:
+                feature_satisfied &= grad > -tol
+            else:
+                feature_satisfied &= grad < tol
+        satisfied &= feature_satisfied
+        feature_rates[feature_name] = float(np.mean(feature_satisfied)) * 100
+    return float(np.mean(satisfied)) * 100, feature_rates
+
+
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def read_excel(path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    return pd.read_excel(path, sheet_name=CFG.SHEET_PERCENT), pd.read_excel(path, sheet_name=CFG.SHEET_GY)
+
+
+def merge_sheets(df_pct: pd.DataFrame, df_gy: pd.DataFrame) -> pd.DataFrame:
+    df_pct, df_gy = df_pct.copy(), df_gy.copy()
+    df_pct["__row_id__"], df_gy["__row_id__"] = range(len(df_pct)), range(len(df_gy))
+    df = pd.merge(df_pct, df_gy, on="__row_id__", how="outer", suffixes=("", "_GY"))
+    df.drop(columns=["__row_id__"], inplace=True)
+    rename_map = {
+        "(x1)T [ºC]": "T", "(x2)ER [-]": "ER", "(x3)Steam/Biomass": "Steam/Biomass",
+        "(x4)C [%wt db]": "C", "(x5)H [%wt db]": "H", "(x6)O [%wt db]": "O",
+        "(x7)Ash [%wt db]": "Ash", "(x8)Moisture [%wt]": "Moisture", "Bed material": "Bed material",
+    }
+    for k, v in CFG.TARGETS_MAP.items():
+        if v in df.columns:
+            df.rename(columns={v: k}, inplace=True)
+    df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
+    if "T" in df.columns:
+        df["T"] = df["T"] + 273.15
+    return df
+
+
+def make_bed_dummies(df: pd.DataFrame) -> pd.DataFrame:
+    dummies = pd.get_dummies(df[BED_COL].astype(str), prefix="Bed", drop_first=False)
+    for val in CFG.BED_MATERIAL_VALUES:
+        if f"Bed_{val}" not in dummies.columns:
+            dummies[f"Bed_{val}"] = 0
+    return pd.concat([df.drop(columns=[BED_COL]), dummies[BED_DUMMIES].astype(int)], axis=1)
+
+
+def zscore_outlier_filter(df: pd.DataFrame, threshold: float = 5.0) -> pd.DataFrame:
+    sub = df[CONTINUOUS_COLS].astype(float)
+    z = (sub - sub.mean()) / sub.std(ddof=0).replace(0, np.nan)
+    return df.loc[(z.abs() <= threshold).all(axis=1)].copy()
+
+
+def split_target(df: pd.DataFrame, target: str) -> pd.DataFrame:
+    return df.loc[df[target].replace([np.inf, -np.inf], np.nan).notna()].copy()
+
+
+def fit_scaler(df_train: pd.DataFrame) -> StandardScaler:
+    scaler = StandardScaler()
+    scaler.fit(df_train[CONTINUOUS_COLS].astype(float).values)
+    return scaler
+
+
+def transform_features(df: pd.DataFrame, scaler: StandardScaler) -> np.ndarray:
+    Xc = scaler.transform(df[CONTINUOUS_COLS].astype(float).values)
+    return np.hstack([Xc, df[BED_DUMMIES].astype(int).values])
+
+
+def inverse_transform_feature(scaler: StandardScaler, feat_idx: int, scaled_vals: np.ndarray) -> np.ndarray:
+    """Convert scaled feature values back to original scale."""
+    mean = scaler.mean_[feat_idx]
+    std = scaler.scale_[feat_idx]
+    return scaled_vals * std + mean
+
+
+def load_and_prepare_data() -> pd.DataFrame:
+    df_pct, df_gy = read_excel(CFG.DATA_PATH)
+    df = make_bed_dummies(merge_sheets(df_pct, df_gy))
+    df = zscore_outlier_filter(df, threshold=5.0)
+    print(f"Data loaded: {len(df)} samples")
+    return df
+
+
+class GAMModelWrapper(ABC, BaseEstimator, RegressorMixin):
+    def __init__(self, name: str, monotonic: bool = False):
+        self.name = name
+        self.monotonic = monotonic
+        self.model = None
+        self.is_fitted = False
+        self.fit_time = 0.0
+        self.target = None
+    
+    @abstractmethod
+    def _build_model(self, target: str = None) -> Any:
+        pass
+    
+    def fit(self, X: np.ndarray, y: np.ndarray, target: str = None) -> 'GAMModelWrapper':
+        self.target = target
+        start = time.time()
+        self.model = self._build_model(target)
+        self.model.fit(X, y)
+        self.fit_time = time.time() - start
+        self.is_fitted = True
+        return self
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return self.model.predict(X)
+    
+    @abstractmethod
+    def clone(self) -> 'GAMModelWrapper':
+        pass
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        return {}
+
+
+class EBMWrapper(GAMModelWrapper):
+    def __init__(self, monotonic: bool = False, interactions: int = 0):
+        super().__init__(name="EBM_Mono" if monotonic else "EBM", monotonic=monotonic)
+        self.interactions = interactions
+    
+    def _build_model(self, target: str = None) -> Any:
+        from interpret.glassbox import ExplainableBoostingRegressor
+        constraints = get_constraints_vector(target) if self.monotonic and target else None
+        return ExplainableBoostingRegressor(
+            feature_names=FEATURE_COLUMNS, max_bins=256, outer_bags=14, inner_bags=0,
+            learning_rate=0.01, interactions=self.interactions, max_leaves=3, min_samples_leaf=2,
+            max_rounds=5000, early_stopping_rounds=50, random_state=CFG.RANDOM_STATE, n_jobs=-1,
+            monotone_constraints=constraints,
+        )
+    
+    def clone(self) -> 'EBMWrapper':
+        return EBMWrapper(monotonic=self.monotonic, interactions=self.interactions)
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        try:
+            data = self.model.explain_global().data()
+            return {data['names'][i]: float(data['scores'][i]) for i in range(len(data['names']))}
+        except:
+            return {}
+
+
+class PyGAMWrapper(GAMModelWrapper):
+    def __init__(self, monotonic: bool = False, n_splines: int = 20, lam: float = 0.6):
+        super().__init__(name="pyGAM_Mono" if monotonic else "pyGAM", monotonic=monotonic)
+        self.n_splines = n_splines
+        self.lam = lam
+    
+    def _build_model(self, target: str = None) -> Any:
+        from pygam import LinearGAM, s, l
+        constraints_vec = get_constraints_vector(target) if self.monotonic and target else [0]*len(FEATURE_COLUMNS)
+        terms = None
+        for i in range(len(FEATURE_COLUMNS)):
+            if i < N_CONTINUOUS:
+                c = constraints_vec[i]
+                if c > 0:
+                    term = s(i, n_splines=self.n_splines, lam=self.lam, constraints='monotonic_inc')
+                elif c < 0:
+                    term = s(i, n_splines=self.n_splines, lam=self.lam, constraints='monotonic_dec')
+                else:
+                    term = s(i, n_splines=self.n_splines, lam=self.lam)
+            else:
+                term = l(i)
+            terms = term if terms is None else terms + term
+        return LinearGAM(terms)
+    
+    def clone(self) -> 'PyGAMWrapper':
+        return PyGAMWrapper(monotonic=self.monotonic, n_splines=self.n_splines, lam=self.lam)
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        try:
+            edof = self.model.statistics_['edof_per_feature']
+            return {FEATURE_COLUMNS[i]: float(edof[i]) for i in range(len(FEATURE_COLUMNS))}
+        except:
+            return {}
+
+
+class GA2MWrapper(GAMModelWrapper):
+    def __init__(self, monotonic: bool = False, interactions: float = 0.9):
+        super().__init__(name="GA2M_Mono" if monotonic else "GA2M", monotonic=monotonic)
+        self.interactions = interactions
+    
+    def _build_model(self, target: str = None) -> Any:
+        from interpret.glassbox import ExplainableBoostingRegressor
+        constraints = get_constraints_vector(target) if self.monotonic and target else None
+        return ExplainableBoostingRegressor(
+            feature_names=FEATURE_COLUMNS, max_bins=256, outer_bags=14, inner_bags=0,
+            learning_rate=0.01, interactions=self.interactions, max_leaves=3, min_samples_leaf=2,
+            max_rounds=5000, early_stopping_rounds=50, random_state=CFG.RANDOM_STATE, n_jobs=-1,
+            monotone_constraints=constraints,
+        )
+    
+    def clone(self) -> 'GA2MWrapper':
+        return GA2MWrapper(monotonic=self.monotonic, interactions=self.interactions)
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        try:
+            data = self.model.explain_global().data()
+            return {data['names'][i]: float(data['scores'][i]) for i in range(len(data['names']))}
+        except:
+            return {}
+
+
+class NAMWrapper(GAMModelWrapper):
+    def __init__(self, monotonic: bool = False, hidden_units: List[int] = None, epochs: int = 200, lr: float = 0.01):
+        super().__init__(name="NAM_Mono" if monotonic else "NAM", monotonic=monotonic)
+        self.hidden_units = hidden_units or [64, 32]
+        self.epochs = epochs
+        self.lr = lr
+        self._feature_nns = None
+        self._bias = None
+        self._device = None
+        self._constraints = None
+        self._X_train = None
+        self._isotonic_models = None
+    
+    def _build_model(self, target: str = None) -> Any:
+        if self.monotonic and target:
+            self._constraints = get_constraints_vector(target)
+        return self
+    
+    def fit(self, X: np.ndarray, y: np.ndarray, target: str = None) -> 'NAMWrapper':
+        import torch
+        import torch.nn as nn
+        self.target = target
+        start = time.time()
+        if self.monotonic and target:
+            self._constraints = get_constraints_vector(target)
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._X_train = X.copy()
+        X_t = torch.tensor(X, dtype=torch.float32, device=self._device)
+        y_t = torch.tensor(y, dtype=torch.float32, device=self._device).reshape(-1, 1)
+        self._feature_nns = nn.ModuleList()
+        for i in range(X.shape[1]):
+            layers = []
+            in_dim = 1
+            for h in self.hidden_units:
+                layers.append(nn.Linear(in_dim, h))
+                layers.append(nn.ReLU())
+                in_dim = h
+            layers.append(nn.Linear(in_dim, 1))
+            self._feature_nns.append(nn.Sequential(*layers).to(self._device))
+        self._bias = nn.Parameter(torch.zeros(1, device=self._device))
+        params = list(self._feature_nns.parameters()) + [self._bias]
+        optimizer = torch.optim.Adam(params, lr=self.lr)
+        for _ in range(self.epochs):
+            optimizer.zero_grad()
+            pred = self._bias.clone()
+            for i, nn_i in enumerate(self._feature_nns):
+                pred = pred + nn_i(X_t[:, i:i+1])
+            loss = nn.MSELoss()(pred, y_t)
+            loss.backward()
+            optimizer.step()
+        if self.monotonic and self._constraints:
+            self._build_isotonic_models(X)
+        self.model = self
+        self.fit_time = time.time() - start
+        self.is_fitted = True
+        return self
+    
+    def _build_isotonic_models(self, X: np.ndarray):
+        from sklearn.isotonic import IsotonicRegression
+        from scipy.interpolate import interp1d
+        import torch
+        self._isotonic_models = {}
+        for i in range(N_CONTINUOUS):
+            if self._constraints[i] == 0:
+                continue
+            x_vals = np.linspace(X[:, i].min(), X[:, i].max(), 200)
+            with torch.no_grad():
+                x_t = torch.tensor(x_vals.reshape(-1, 1), dtype=torch.float32, device=self._device)
+                y_vals = self._feature_nns[i](x_t).cpu().numpy().flatten()
+            sort_idx = np.argsort(x_vals)
+            x_sorted, y_sorted = x_vals[sort_idx], y_vals[sort_idx]
+            increasing = self._constraints[i] > 0
+            ir = IsotonicRegression(increasing=increasing, out_of_bounds='clip')
+            y_mono = ir.fit_transform(x_sorted, y_sorted)
+            self._isotonic_models[i] = {
+                'original': interp1d(x_sorted, y_sorted, kind='linear', bounds_error=False, fill_value=(y_sorted[0], y_sorted[-1])),
+                'monotonic': interp1d(x_sorted, y_mono, kind='linear', bounds_error=False, fill_value=(y_mono[0], y_mono[-1])),
+            }
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        import torch
+        X_t = torch.tensor(X, dtype=torch.float32, device=self._device)
+        with torch.no_grad():
+            pred = self._bias.clone().cpu().numpy().flatten()[0]
+            pred = np.full(X.shape[0], pred)
+            for i, nn_i in enumerate(self._feature_nns):
+                f_vals = nn_i(X_t[:, i:i+1]).cpu().numpy().flatten()
+                if self.monotonic and self._isotonic_models and i in self._isotonic_models:
+                    mono_vals = self._isotonic_models[i]['monotonic'](X[:, i])
+                    pred += mono_vals
+                else:
+                    pred += f_vals
+        return pred
+    
+    def clone(self) -> 'NAMWrapper':
+        return NAMWrapper(monotonic=self.monotonic, hidden_units=self.hidden_units, epochs=self.epochs, lr=self.lr)
+
+
+class GAMMWrapper(GAMModelWrapper):
+    def __init__(self, monotonic: bool = False, n_splines: int = 15, lam: float = 0.6, random_intercept: bool = True):
+        super().__init__(name="GAMM_Mono" if monotonic else "GAMM", monotonic=monotonic)
+        self.n_splines = n_splines
+        self.lam = lam
+        self.random_intercept = random_intercept
+        self._random_effects = None
+        self._gam_model = None
+    
+    def _build_model(self, target: str = None) -> Any:
+        return self
+    
+    def fit(self, X: np.ndarray, y: np.ndarray, target: str = None) -> 'GAMMWrapper':
+        from pygam import LinearGAM, s, l
+        self.target = target
+        start = time.time()
+        constraints_vec = get_constraints_vector(target) if self.monotonic and target else [0]*len(FEATURE_COLUMNS)
+        terms = None
+        for i in range(N_CONTINUOUS):
+            c = constraints_vec[i]
+            if c > 0:
+                term = s(i, n_splines=self.n_splines, lam=self.lam, constraints='monotonic_inc')
+            elif c < 0:
+                term = s(i, n_splines=self.n_splines, lam=self.lam, constraints='monotonic_dec')
+            else:
+                term = s(i, n_splines=self.n_splines, lam=self.lam)
+            terms = term if terms is None else terms + term
+        for i in range(N_CONTINUOUS, len(FEATURE_COLUMNS)):
+            terms = terms + l(i)
+        self._gam_model = LinearGAM(terms)
+        self._gam_model.fit(X, y)
+        if self.random_intercept:
+            residuals = y - self._gam_model.predict(X)
+            self._random_effects = {}
+            for bed_idx in range(4):
+                col_idx = N_CONTINUOUS + bed_idx
+                mask = X[:, col_idx] == 1
+                if np.sum(mask) > 0:
+                    self._random_effects[bed_idx] = float(np.mean(residuals[mask]))
+                else:
+                    self._random_effects[bed_idx] = 0.0
+        self.model = self
+        self.fit_time = time.time() - start
+        self.is_fitted = True
+        return self
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        pred = self._gam_model.predict(X)
+        if self.random_intercept and self._random_effects:
+            for bed_idx in range(4):
+                col_idx = N_CONTINUOUS + bed_idx
+                mask = X[:, col_idx] == 1
+                if np.sum(mask) > 0:
+                    pred[mask] += self._random_effects.get(bed_idx, 0.0)
+        return pred
+    
+    def clone(self) -> 'GAMMWrapper':
+        return GAMMWrapper(monotonic=self.monotonic, n_splines=self.n_splines, lam=self.lam, random_intercept=self.random_intercept)
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        try:
+            edof = self._gam_model.statistics_['edof_per_feature']
+            return {FEATURE_COLUMNS[i]: float(edof[i]) for i in range(len(FEATURE_COLUMNS))}
+        except:
+            return {}
+
+
+def get_available_models(include_monotonic: bool = True) -> List[GAMModelWrapper]:
+    available = []
+    model_configs = [
+        (EBMWrapper, "interpret", {"monotonic": False}),
+        (PyGAMWrapper, "pygam", {"monotonic": False}),
+        (GA2MWrapper, "interpret", {"monotonic": False}),
+        (NAMWrapper, "torch", {"monotonic": False}),
+        (GAMMWrapper, "pygam", {"monotonic": False}),
+    ]
+    if include_monotonic:
+        model_configs.extend([
+            (EBMWrapper, "interpret", {"monotonic": True}),
+            (PyGAMWrapper, "pygam", {"monotonic": True}),
+            (GA2MWrapper, "interpret", {"monotonic": True}),
+            (NAMWrapper, "torch", {"monotonic": True}),
+            (GAMMWrapper, "pygam", {"monotonic": True}),
+        ])
+    for model_cls, package, kwargs in model_configs:
+        try:
+            __import__(package)
+            m = model_cls(**kwargs)
+            available.append(m)
+            print(f"  [OK] {m.name} ({package})")
+        except ImportError:
+            name = f"{model_cls.__name__.replace('Wrapper', '')}_Mono" if kwargs.get('monotonic') else model_cls.__name__.replace('Wrapper', '')
+            print(f"  [SKIP] {name} - {package} not installed")
+        except Exception as e:
+            name = f"{model_cls.__name__.replace('Wrapper', '')}_Mono" if kwargs.get('monotonic') else model_cls.__name__.replace('Wrapper', '')
+            print(f"  [SKIP] {name} - {type(e).__name__}: {str(e)[:50]}")
+    return available
+
+
+def get_hyperparameter_space(model_name: str, trial) -> Dict[str, Any]:
+    base_name = model_name.replace("_Mono", "")
+    if base_name == "EBM":
+        return {"max_leaves": trial.suggest_int("max_leaves", 2, 4), "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.1, log=True)}
+    elif base_name == "pyGAM":
+        return {"n_splines": trial.suggest_int("n_splines", 10, 30), "lam": trial.suggest_float("lam", 0.01, 10.0, log=True)}
+    elif base_name == "GA2M":
+        return {"interactions": trial.suggest_float("interactions", 0.5, 0.95)}
+    elif base_name == "NAM":
+        return {"hidden_units": trial.suggest_categorical("hidden_units", [[32, 16], [64, 32], [128, 64]]), "epochs": trial.suggest_int("epochs", 100, 400), "lr": trial.suggest_float("lr", 0.001, 0.05, log=True)}
+    elif base_name == "GAMM":
+        return {"n_splines": trial.suggest_int("n_splines", 10, 25), "lam": trial.suggest_float("lam", 0.01, 10.0, log=True)}
+    return {}
+
+
+def create_model_with_params(model_wrapper: GAMModelWrapper, params: Dict[str, Any]) -> GAMModelWrapper:
+    base_name = model_wrapper.name.replace("_Mono", "")
+    monotonic = model_wrapper.monotonic
+    if base_name == "EBM":
+        return EBMWrapper(monotonic=monotonic)
+    elif base_name == "pyGAM":
+        return PyGAMWrapper(monotonic=monotonic, n_splines=params.get("n_splines", 20), lam=params.get("lam", 0.6))
+    elif base_name == "GA2M":
+        return GA2MWrapper(monotonic=monotonic, interactions=params.get("interactions", 0.9))
+    elif base_name == "NAM":
+        return NAMWrapper(monotonic=monotonic, hidden_units=params.get("hidden_units", [64, 32]), epochs=params.get("epochs", 200), lr=params.get("lr", 0.01))
+    elif base_name == "GAMM":
+        return GAMMWrapper(monotonic=monotonic, n_splines=params.get("n_splines", 15), lam=params.get("lam", 0.6))
+    return model_wrapper.clone()
+
+
+class BayesianOptimizer:
+    def __init__(self, n_trials: int = 30, cv_folds: int = 3, random_state: int = 42):
+        self.n_trials = n_trials
+        self.cv_folds = cv_folds
+        self.random_state = random_state
+        self.best_params = {}
+        self.study_results = {}
+    
+    def optimize(self, model_wrapper: GAMModelWrapper, X: np.ndarray, y: np.ndarray, target: str) -> Tuple[Dict[str, Any], float]:
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        except ImportError:
+            return {}, np.nan
+        model_name = model_wrapper.name
+        def objective(trial):
+            params = get_hyperparameter_space(model_name, trial)
+            if not params:
+                return float('inf')
+            kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+            scores = []
+            for train_idx, val_idx in kf.split(X):
+                try:
+                    model = create_model_with_params(model_wrapper, params)
+                    model.fit(X[train_idx], y[train_idx], target=target)
+                    scores.append(np.sqrt(mean_squared_error(y[val_idx], model.predict(X[val_idx]))))
+                except:
+                    scores.append(float('inf'))
+            return np.mean(scores)
+        sampler = optuna.samplers.TPESampler(seed=self.random_state)
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
+        self.best_params[model_name] = study.best_params
+        self.study_results[model_name] = {"best_params": study.best_params, "best_score": study.best_value}
+        return study.best_params, study.best_value
+    
+    def get_optimized_model(self, model_wrapper: GAMModelWrapper) -> GAMModelWrapper:
+        if model_wrapper.name in self.best_params:
+            return create_model_with_params(model_wrapper, self.best_params[model_wrapper.name])
+        return model_wrapper.clone()
+    
+    def save_results(self, save_dir: str) -> None:
+        if not self.study_results:
+            return
+        rows = [{"Model": k, "Best_RMSE": v["best_score"], **{f"param_{pk}": pv for pk, pv in v["best_params"].items()}} for k, v in self.study_results.items()]
+        pd.DataFrame(rows).to_excel(os.path.join(save_dir, "bayesian_optimization_results.xlsx"), index=False)
+
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    return {
+        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "R2": float(r2_score(y_true, y_pred)),
+        "MAPE": float(mean_absolute_percentage_error(y_true, y_pred) * 100),
+    }
+
+
+def setup_publication_axes(ax, xlabel=None, ylabel=None, title=None):
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
+    ax.yaxis.set_minor_locator(AutoMinorLocator())
+    ax.tick_params(which='both', direction='in', top=True, right=True)
+    ax.tick_params(which='major', length=4, width=0.8)
+    ax.tick_params(which='minor', length=2, width=0.5)
+    if xlabel:
+        ax.set_xlabel(xlabel, fontweight='normal')
+    if ylabel:
+        ax.set_ylabel(ylabel, fontweight='normal')
+    if title:
+        ax.set_title(title, fontweight='bold', pad=8)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.8)
+    return ax
+
+
+def plot_feature_importance(model: GAMModelWrapper, save_dir: str, target: str) -> pd.DataFrame:
+    importance = model.get_feature_importance()
+    if not importance:
+        return pd.DataFrame()
+    sorted_items = sorted(importance.items(), key=lambda x: abs(x[1]), reverse=True)
+    names, values = [x[0] for x in sorted_items], [x[1] for x in sorted_items]
+    fig, ax = plt.subplots(figsize=(4.5, 3.5))
+    colors = [COLORS[i % len(COLORS)] for i in range(len(names))]
+    ax.barh(range(len(names)), values, color=colors, edgecolor='black', linewidth=0.5, height=0.7)
+    ax.set_yticks(range(len(names)))
+    ax.set_yticklabels(names, fontsize=9)
+    setup_publication_axes(ax, xlabel='Relative Importance', title=f'{model.name} ({target})')
+    ax.invert_yaxis()
+    ax.set_xlim(left=0)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_feature_importance.png"), dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_feature_importance.pdf"), bbox_inches='tight', facecolor='white')
+    plt.close()
+    df = pd.DataFrame({"Feature": names, "Importance": values})
+    df.to_excel(os.path.join(save_dir, f"{model.name}_{target}_feature_importance.xlsx"), index=False)
+    return df
+
+
+def plot_prediction_scatter_train_test(y_train: np.ndarray, y_pred_train: np.ndarray, 
+                                       y_test: np.ndarray, y_pred_test: np.ndarray,
+                                       model_name: str, target: str, save_dir: str) -> pd.DataFrame:
+    """Plot prediction scatter with train/test distinction and both R² values."""
+    fig, ax = plt.subplots(figsize=(4.5, 4.5))
+    
+    # Plot training data (blue, more transparent)
+    ax.scatter(y_train, y_pred_train, c=COLORS[1], alpha=0.4, s=25, edgecolors='none',
+               label='Training', zorder=2, marker='o')
+    
+    # Plot test data (red, more prominent)
+    ax.scatter(y_test, y_pred_test, c=COLORS[0], alpha=0.7, s=40, edgecolors='white',
+               linewidth=0.5, label='Test', zorder=3, marker='s')
+    
+    # Perfect prediction line
+    all_y = np.concatenate([y_train, y_test])
+    all_pred = np.concatenate([y_pred_train, y_pred_test])
+    min_val, max_val = min(all_y.min(), all_pred.min()), max(all_y.max(), all_pred.max())
+    margin = (max_val - min_val) * 0.05
+    lims = [min_val - margin, max_val + margin]
+    ax.plot(lims, lims, 'k-', lw=1.2, alpha=0.8, zorder=1)
+    
+    # +/- 10% error bands
+    ax.fill_between(lims, [l*0.9 for l in lims], [l*1.1 for l in lims], 
+                    alpha=0.08, color='gray', zorder=0)
+    
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.set_aspect('equal')
+    
+    # Metrics annotation with both R² values
+    r2_train = r2_score(y_train, y_pred_train)
+    r2_test = r2_score(y_test, y_pred_test)
+    rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
+    mae_test = mean_absolute_error(y_test, y_pred_test)
+    
+    textstr = (f"Training $R^2$ = {r2_train:.3f}\n"
+               f"Test $R^2$ = {r2_test:.3f}\n"
+               f"Test RMSE = {rmse_test:.3f}\n"
+               f"Test MAE = {mae_test:.3f}")
+    props = dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.95, edgecolor='gray', linewidth=0.5)
+    ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=9, verticalalignment='top',
+            bbox=props, family='serif')
+    
+    setup_publication_axes(ax, 
+                          xlabel=f'Measured {TARGET_UNITS.get(target, target)}',
+                          ylabel=f'Predicted {TARGET_UNITS.get(target, target)}',
+                          title=f'{model_name}')
+    
+    ax.legend(loc='lower right', fontsize=8, framealpha=0.95, markerscale=0.8)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{model_name}_{target}_scatter.png"), dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(os.path.join(save_dir, f"{model_name}_{target}_scatter.pdf"), bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    df = pd.DataFrame({
+        "Set": ["Train"]*len(y_train) + ["Test"]*len(y_test),
+        "Actual": np.concatenate([y_train, y_test]),
+        "Predicted": np.concatenate([y_pred_train, y_pred_test]),
+    })
+    df.to_excel(os.path.join(save_dir, f"{model_name}_{target}_predictions.xlsx"), index=False)
+    return df
+
+
+def plot_residuals(y_true: np.ndarray, y_pred: np.ndarray, model_name: str, target: str, save_dir: str) -> pd.DataFrame:
+    residuals = y_true - y_pred
+    fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))
+    ax1 = axes[0]
+    ax1.scatter(y_pred, residuals, c=COLORS[1], alpha=0.6, s=25, edgecolors='white', linewidth=0.3)
+    ax1.axhline(y=0, color='black', linestyle='-', lw=1, alpha=0.8)
+    ax1.axhline(y=2*np.std(residuals), color='red', linestyle='--', lw=0.8, alpha=0.6)
+    ax1.axhline(y=-2*np.std(residuals), color='red', linestyle='--', lw=0.8, alpha=0.6)
+    setup_publication_axes(ax1, xlabel=f'Predicted {TARGET_UNITS.get(target, target)}', ylabel='Residual', title='(a) Residuals vs. Predicted')
+    ax2 = axes[1]
+    ax2.hist(residuals, bins=25, edgecolor='black', linewidth=0.5, alpha=0.8, color=COLORS[2], density=True)
+    from scipy import stats
+    mu, std = stats.norm.fit(residuals)
+    x = np.linspace(residuals.min(), residuals.max(), 100)
+    ax2.plot(x, stats.norm.pdf(x, mu, std), 'k-', lw=1.5, label=f'Normal fit\n($\\mu$={mu:.2f}, $\\sigma$={std:.2f})')
+    ax2.axvline(x=0, color='red', linestyle='--', lw=1, alpha=0.8)
+    setup_publication_axes(ax2, xlabel='Residual', ylabel='Density', title='(b) Residual Distribution')
+    ax2.legend(loc='upper left', fontsize=8)
+    fig.suptitle(f'{model_name} - {target}', fontsize=12, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{model_name}_{target}_residuals.png"), dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(os.path.join(save_dir, f"{model_name}_{target}_residuals.pdf"), bbox_inches='tight', facecolor='white')
+    plt.close()
+    return pd.DataFrame({"Predicted": y_pred, "Residual": residuals})
+
+
+def plot_comparison_boxplot(df_results: pd.DataFrame, target: str, save_dir: str) -> None:
+    df_target = df_results[df_results["Target"] == target]
+    if df_target.empty:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    models = sorted(df_target["Model"].unique())
+    metrics_config = [("RMSE", "RMSE", False), ("R2", r"$R^2$", True), ("PhysRate", "Physical Conformity [%]", True)]
+    for ax, (metric, ylabel, _) in zip(axes, metrics_config):
+        data = [df_target[df_target["Model"] == m][metric].dropna().values for m in models]
+        bp = ax.boxplot(data, labels=models, patch_artist=True, widths=0.6)
+        for i, patch in enumerate(bp['boxes']):
+            patch.set_facecolor(COLORS[i % len(COLORS)])
+            patch.set_alpha(0.7)
+            patch.set_edgecolor('black')
+        setup_publication_axes(ax, ylabel=ylabel)
+        ax.tick_params(axis='x', rotation=45)
+        if metric == "PhysRate":
+            ax.set_ylim(0, 105)
+            ax.axhline(y=100, color='green', linestyle='--', lw=0.8, alpha=0.6)
+    fig.suptitle(f'Model Comparison - {TARGET_UNITS.get(target, target)}', fontsize=12, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{target}_comparison_boxplot.png"), dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(os.path.join(save_dir, f"{target}_comparison_boxplot.pdf"), bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
+def plot_overall_heatmap(df_agg: pd.DataFrame, metric: str, save_dir: str) -> None:
+    metric_col = f"{metric}_mean"
+    if metric_col not in df_agg.columns:
+        return
+    pivot = df_agg.pivot(index="Model", columns="Target", values=metric_col)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    cmap = 'RdYlGn' if metric in ["R2", "PhysRate"] else 'RdYlGn_r'
+    vmin, vmax = pivot.values.min() * 0.95, pivot.values.max() * 1.02
+    im = ax.imshow(pivot.values, cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax)
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_xticklabels([TARGET_UNITS.get(c, c) for c in pivot.columns], fontsize=9)
+    ax.set_yticklabels(pivot.index, fontsize=9)
+    fmt = ".1f" if metric == "PhysRate" else ".3f"
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            val = pivot.iloc[i, j]
+            if not np.isnan(val):
+                text_color = 'white' if (val < (vmin + vmax)/2 and metric not in ["R2", "PhysRate"]) or (val > (vmin + vmax)/2 and metric in ["R2", "PhysRate"]) else 'black'
+                ax.text(j, i, f"{val:{fmt}}", ha="center", va="center", fontsize=8, color=text_color)
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+    metric_label = "$R^2$" if metric == "R2" else (f"{metric} [%]" if metric == "PhysRate" else metric)
+    cbar.set_label(metric_label, fontsize=10)
+    ax.set_xlabel('Target Variable', fontsize=10)
+    ax.set_ylabel('Model', fontsize=10)
+    title_metric = "$R^2$" if metric == "R2" else metric
+    ax.set_title(f'{title_metric} Comparison Across Models and Targets', fontsize=11, fontweight='bold', pad=10)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"heatmap_{metric}.png"), dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(os.path.join(save_dir, f"heatmap_{metric}.pdf"), bbox_inches='tight', facecolor='white')
+    plt.close()
+    pivot.to_excel(os.path.join(save_dir, f"heatmap_{metric}.xlsx"))
+
+
+def plot_shape_functions(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler, 
+                        target: str, save_dir: str) -> pd.DataFrame:
+    """Plot shape functions with original scale x-axis."""
+    ensure_dir(save_dir)
+    all_data = []
+    base_name = model.name.replace("_Mono", "")
+    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+    axes = axes.flatten()
+    
+    if base_name in ["EBM", "GA2M"]:
+        try:
+            ebm_global = model.model.explain_global()
+            data_dict = ebm_global.data()
+            for i in range(N_CONTINUOUS):
+                ax = axes[i]
+                feat_name = CONTINUOUS_COLS[i]
+                if feat_name in data_dict['names']:
+                    idx = data_dict['names'].index(feat_name)
+                    # EBM stores data in different format
+                    if 'left_names' in data_dict and idx < len(data_dict['left_names']):
+                        x_vals_scaled = np.array(data_dict['left_names'][idx])
+                        y_vals = np.array(data_dict['scores'][idx])
+                    else:
+                        # Fallback: compute via partial dependence
+                        x_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 50)
+                        y_vals = []
+                        X_base = X.mean(axis=0)
+                        for xv in x_scaled:
+                            X_temp = np.tile(X_base, (1, 1))
+                            X_temp[0, i] = xv
+                            y_vals.append(model.predict(X_temp)[0])
+                        x_vals_scaled = x_scaled
+                        y_vals = np.array(y_vals) - np.mean(y_vals)
+                else:
+                    x_vals_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 50)
+                    y_vals = []
+                    X_base = X.mean(axis=0)
+                    for xv in x_vals_scaled:
+                        X_temp = np.tile(X_base, (1, 1))
+                        X_temp[0, i] = xv
+                        y_vals.append(model.predict(X_temp)[0])
+                    y_vals = np.array(y_vals) - np.mean(y_vals)
+                
+                # Convert to original scale
+                x_vals_orig = inverse_transform_feature(scaler, i, np.array(x_vals_scaled).flatten())
+                y_vals = np.array(y_vals).flatten()
+                
+                ax.plot(x_vals_orig, y_vals, color=COLORS[0], lw=1.5)
+                ax.fill_between(x_vals_orig, 0, y_vals, alpha=0.2, color=COLORS[0])
+                ax.axhline(y=0, color='gray', linestyle='--', lw=0.8, alpha=0.6)
+                setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name), 
+                                      ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
+                all_data.append({"Feature": feat_name, "X_values": list(x_vals_orig), "Y_values": list(y_vals)})
+        except Exception as e:
+            print(f"    Shape functions error (EBM/GA2M): {e}")
+            # Fallback to manual partial dependence
+            for i in range(N_CONTINUOUS):
+                ax = axes[i]
+                feat_name = CONTINUOUS_COLS[i]
+                x_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 50)
+                y_vals = []
+                for xv in x_scaled:
+                    X_temp = X.copy()
+                    X_temp[:, i] = xv
+                    y_vals.append(np.mean(model.predict(X_temp)))
+                y_centered = np.array(y_vals) - np.mean(y_vals)
+                x_orig = inverse_transform_feature(scaler, i, x_scaled)
+                ax.plot(x_orig, y_centered, color=COLORS[0], lw=1.5)
+                ax.fill_between(x_orig, 0, y_centered, alpha=0.2, color=COLORS[0])
+                ax.axhline(y=0, color='gray', linestyle='--', lw=0.8, alpha=0.6)
+                setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name),
+                                      ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
+                all_data.append({"Feature": feat_name, "X_values": list(x_orig), "Y_values": list(y_centered)})
+                
+    elif base_name in ["pyGAM", "GAMM"]:
+        try:
+            gam_model = model._gam_model if base_name == "GAMM" else model.model
+            for i in range(N_CONTINUOUS):
+                ax = axes[i]
+                feat_name = CONTINUOUS_COLS[i]
+                XX = gam_model.generate_X_grid(term=i, n=100)
+                pdep, confi = gam_model.partial_dependence(term=i, X=XX, width=0.95)
+                x_scaled = XX[:, i]
+                x_orig = inverse_transform_feature(scaler, i, x_scaled)
+                ax.plot(x_orig, pdep, color=COLORS[0], lw=1.5)
+                ax.fill_between(x_orig, confi[:, 0], confi[:, 1], alpha=0.2, color=COLORS[0])
+                ax.axhline(y=0, color='gray', linestyle='--', lw=0.8, alpha=0.6)
+                setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name),
+                                      ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
+                all_data.append({"Feature": feat_name, "X_values": x_orig.tolist(), "Y_values": pdep.tolist()})
+        except Exception as e:
+            print(f"    Shape functions error (pyGAM/GAMM): {e}")
+    else:
+        # Manual partial dependence for NAM and others
+        for i in range(N_CONTINUOUS):
+            ax = axes[i]
+            feat_name = CONTINUOUS_COLS[i]
+            x_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 50)
+            y_vals = []
+            for xv in x_scaled:
+                X_temp = X.copy()
+                X_temp[:, i] = xv
+                y_vals.append(np.mean(model.predict(X_temp)))
+            y_centered = np.array(y_vals) - np.mean(y_vals)
+            x_orig = inverse_transform_feature(scaler, i, x_scaled)
+            ax.plot(x_orig, y_centered, color=COLORS[0], lw=1.5)
+            ax.fill_between(x_orig, 0, y_centered, alpha=0.2, color=COLORS[0])
+            ax.axhline(y=0, color='gray', linestyle='--', lw=0.8, alpha=0.6)
+            setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name),
+                                  ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
+            all_data.append({"Feature": feat_name, "X_values": x_orig.tolist(), "Y_values": y_centered.tolist()})
+    
+    fig.suptitle(f'{model.name} Shape Functions - {TARGET_UNITS.get(target, target)}', fontsize=12, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_shape_functions.png"), dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_shape_functions.pdf"), bbox_inches='tight', facecolor='white')
+    plt.close()
+    df = pd.DataFrame(all_data)
+    df.to_excel(os.path.join(save_dir, f"{model.name}_{target}_shape_functions.xlsx"), index=False)
+    return df
+
+
+def plot_ice_pdp(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler,
+                target: str, save_dir: str, n_ice_lines: int = 50) -> pd.DataFrame:
+    """Plot ICE/PDP with original scale x-axis."""
+    ensure_dir(save_dir)
+    all_data = []
+    n_samples = min(n_ice_lines, X.shape[0])
+    sample_indices = np.random.choice(X.shape[0], n_samples, replace=False)
+    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+    axes = axes.flatten()
+    
+    for feat_idx in range(N_CONTINUOUS):
+        ax = axes[feat_idx]
+        feat_name = CONTINUOUS_COLS[feat_idx]
+        
+        # Use scaled values for model prediction
+        x_scaled = np.linspace(X[:, feat_idx].min(), X[:, feat_idx].max(), 50)
+        # Convert to original scale for plotting
+        x_orig = inverse_transform_feature(scaler, feat_idx, x_scaled)
+        
+        ice_curves = []
+        for sample_idx in sample_indices:
+            y_vals = []
+            for xv in x_scaled:
+                X_temp = X[sample_idx:sample_idx+1].copy()
+                X_temp[0, feat_idx] = xv
+                y_vals.append(model.predict(X_temp)[0])
+            ice_curves.append(y_vals)
+            ax.plot(x_orig, y_vals, color=COLORS[1], alpha=0.1, lw=0.5)
+        
+        pdp = np.mean(ice_curves, axis=0)
+        ax.plot(x_orig, pdp, color=COLORS[0], lw=2, label='PDP')
+        
+        setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name),
+                              ylabel=f'Predicted {target}', title=f'({chr(97+feat_idx)}) {feat_name}')
+        if feat_idx == 0:
+            ax.legend(loc='best', fontsize=8)
+        all_data.append({"Feature": feat_name, "X_values": x_orig.tolist(), "PDP": pdp.tolist()})
+    
+    fig.suptitle(f'{model.name} ICE/PDP - {TARGET_UNITS.get(target, target)}', fontsize=12, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_ice_pdp.png"), dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_ice_pdp.pdf"), bbox_inches='tight', facecolor='white')
+    plt.close()
+    df = pd.DataFrame(all_data)
+    df.to_excel(os.path.join(save_dir, f"{model.name}_{target}_ice_pdp.xlsx"), index=False)
+    return df
+
+
+def plot_bivariate_3d(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler,
+                     target: str, save_dir: str) -> None:
+    """
+    Plot 3D surface plots for bivariate dependencies.
+    Generates C(8,2)=28 independent plots for all pairs of 8 continuous features.
+    Each plot is saved as a separate file to ensure complete display without clipping.
+    
+    Reference: Lou et al. (2013) GA2M pairwise interaction visualization.
+    """
+    from itertools import combinations
+    
+    # Create dedicated subdirectory for bivariate plots
+    bivariate_dir = os.path.join(save_dir, "bivariate_3d")
+    ensure_dir(bivariate_dir)
+    
+    # Use ALL 8 continuous features for bivariate analysis
+    # C(8,2) = 28 pairs
+    all_feature_indices = list(range(N_CONTINUOUS))  # 0-7 for all 8 continuous features
+    pairs = list(combinations(all_feature_indices, 2))
+    n_pairs = len(pairs)
+    
+    print(f"      Generating {n_pairs} bivariate 3D plots (8 features, C(8,2)=28 pairs)...")
+    
+    # Compute base prediction input (median of all features)
+    X_base = np.median(X, axis=0)
+    
+    for pair_idx, (i, j) in enumerate(pairs, 1):
+        feat_i, feat_j = CONTINUOUS_COLS[i], CONTINUOUS_COLS[j]
+        
+        print(f"        [{pair_idx}/{n_pairs}] {feat_i} vs {feat_j}")
+        
+        # Create grid in scaled space
+        x_i_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 30)
+        x_j_scaled = np.linspace(X[:, j].min(), X[:, j].max(), 30)
+        Xi_scaled, Xj_scaled = np.meshgrid(x_i_scaled, x_j_scaled)
+        
+        # Convert to original scale for plotting
+        Xi_orig = inverse_transform_feature(scaler, i, Xi_scaled)
+        Xj_orig = inverse_transform_feature(scaler, j, Xj_scaled)
+        
+        # Compute predictions for the grid
+        Z = np.zeros_like(Xi_scaled)
+        for ii in range(Xi_scaled.shape[0]):
+            for jj in range(Xi_scaled.shape[1]):
+                X_temp = X_base.copy().reshape(1, -1)
+                X_temp[0, i] = Xi_scaled[ii, jj]
+                X_temp[0, j] = Xj_scaled[ii, jj]
+                Z[ii, jj] = model.predict(X_temp)[0]
+        
+        # Create independent figure for each pair (larger size for complete display)
+        fig = plt.figure(figsize=(9, 7))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Plot surface
+        surf = ax.plot_surface(Xi_orig, Xj_orig, Z, cmap='viridis', alpha=0.9,
+                              linewidth=0, antialiased=True, edgecolor='none')
+        
+        # Set axis labels with units
+        ax.set_xlabel(FEATURE_UNITS.get(feat_i, feat_i), fontsize=11, fontweight='bold', labelpad=10)
+        ax.set_ylabel(FEATURE_UNITS.get(feat_j, feat_j), fontsize=11, fontweight='bold', labelpad=10)
+        ax.set_zlabel(TARGET_UNITS.get(target, target), fontsize=11, fontweight='bold', labelpad=8)
+        
+        # Set title
+        ax.set_title(f'Bivariate Dependency: {feat_i} vs {feat_j} → {target}', 
+                    fontsize=12, fontweight='bold', pad=15)
+        
+        ax.tick_params(axis='both', which='major', labelsize=9, pad=3)
+        ax.view_init(elev=25, azim=45)
+        
+        # Add colorbar
+        cbar = fig.colorbar(surf, ax=ax, shrink=0.6, aspect=15, pad=0.12)
+        cbar.set_label(TARGET_UNITS.get(target, target), fontsize=10, fontweight='bold')
+        cbar.ax.tick_params(labelsize=8)
+        
+        # Save as independent file
+        fig.tight_layout(rect=[0, 0, 0.95, 1])
+        filename_base = f"bivariate_{feat_i}_{feat_j}".replace("/", "_")
+        plt.savefig(os.path.join(bivariate_dir, f"{filename_base}.png"), 
+                   dpi=200, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+    
+    print(f"      Saved {n_pairs} bivariate 3D plots to {bivariate_dir}")
+
+
+def generate_best_model_analysis(df_results: pd.DataFrame, df: pd.DataFrame, 
+                                 models: List[GAMModelWrapper], save_dir: str) -> None:
+    """Generate advanced analysis for best model including 3D bivariate plots."""
+    print("\n[7] Generating advanced visualizations for best model...")
+    
+    for target in TARGETS:
+        print(f"\n  Target: {target}")
+        df_target = df_results[df_results["Target"] == target]
+        df_agg = df_target.groupby("Model").agg({"PhysRate": "mean", "R2": "mean"}).reset_index()
+        df_perfect = df_agg[df_agg["PhysRate"] >= 99.9]
+        if df_perfect.empty:
+            df_perfect = df_agg.nlargest(3, "PhysRate")
+            print(f"    No model with 100% PhysRate, using top 3")
+        df_best = df_perfect.nlargest(1, "R2")
+        best_model_name = df_best["Model"].iloc[0]
+        best_r2 = df_best["R2"].iloc[0]
+        best_phys = df_best["PhysRate"].iloc[0]
+        print(f"    Best model: {best_model_name} ($R^2$={best_r2:.4f}, PhysRate={best_phys:.1f}%)")
+        
+        best_model = None
+        for m in models:
+            if m.name == best_model_name:
+                best_model = m.clone()
+                break
+        if best_model is None:
+            print(f"    ERROR: Model {best_model_name} not found")
+            continue
+        
+        df_target_data = split_target(df, target)
+        scaler = fit_scaler(df_target_data)
+        X = transform_features(df_target_data, scaler)
+        y = df_target_data[target].values
+        best_model.fit(X, y, target=target)
+        
+        best_dir = os.path.join(save_dir, target, "best_model_analysis")
+        ensure_dir(best_dir)
+        
+        # Skip interpretability plots for GY (no physical constraints, no authoritative trends)
+        if target == "GY":
+            print(f"    Skipping interpretability plots for GY (no physical constraints)")
+        else:
+            print(f"    Generating shape functions...")
+            plot_shape_functions(best_model, X, scaler, target, best_dir)
+            
+            print(f"    Generating ICE/PDP plots...")
+            plot_ice_pdp(best_model, X, scaler, target, best_dir)
+            
+            print(f"    Generating 3D bivariate dependency plots...")
+            plot_bivariate_3d(best_model, X, scaler, target, best_dir)
+        
+        pd.DataFrame([{"Target": target, "Best_Model": best_model_name, "R2": best_r2, "PhysRate": best_phys}]).to_excel(
+            os.path.join(best_dir, "best_model_info.xlsx"), index=False)
+        print(f"    Saved to: {best_dir}")
+
+
+def save_model_and_scaler(model: GAMModelWrapper, scaler: StandardScaler, target: str, save_dir: str) -> Tuple[str, str]:
+    model_dir = os.path.join(save_dir, "saved_models")
+    ensure_dir(model_dir)
+    model_path = os.path.join(model_dir, f"{model.name}_{target}_model.joblib")
+    scaler_path = os.path.join(model_dir, f"{model.name}_{target}_scaler.joblib")
+    if isinstance(model, NAMWrapper):
+        joblib.dump(model, model_path)
+    else:
+        joblib.dump(model.model, model_path)
+    joblib.dump(scaler, scaler_path)
+    return model_path, scaler_path
+
+
+def generate_prediction_script(model_name: str, target: str, save_dir: str) -> None:
+    script_dir = os.path.join(save_dir, "prediction_scripts")
+    ensure_dir(script_dir)
+    script_content = f'''"""Prediction Script for {model_name} - {target}"""
+import numpy as np
+import joblib
+import os
+
+def predict(T, ER, Steam_Biomass, C, H, O, Ash, Moisture, Bed_material):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(script_dir, "..", "saved_models", "{model_name}_{target}_model.joblib")
+    scaler_path = os.path.join(script_dir, "..", "saved_models", "{model_name}_{target}_scaler.joblib")
+    scaler = joblib.load(scaler_path)
+    model = joblib.load(model_path)
+    X_cont = np.array([[T, ER, Steam_Biomass, C, H, O, Ash, Moisture]])
+    X_scaled = scaler.transform(X_cont)
+    bed_dummies = np.zeros((1, 4))
+    if 1 <= Bed_material <= 4:
+        bed_dummies[0, Bed_material - 1] = 1
+    X = np.hstack([X_scaled, bed_dummies])
+    return float(model.predict(X)[0])
+
+if __name__ == "__main__":
+    print("{model_name} Prediction for {target}")
+    T = float(input("T [K]: "))
+    ER = float(input("ER [-]: "))
+    SB = float(input("Steam/Biomass [-]: "))
+    C = float(input("C [%%wt db]: "))
+    H = float(input("H [%%wt db]: "))
+    O = float(input("O [%%wt db]: "))
+    Ash = float(input("Ash [%%wt db]: "))
+    MS = float(input("Moisture [%%wt]: "))
+    Bed = int(input("Bed material [1-4]: "))
+    print(f"Predicted {target}: {{predict(T, ER, SB, C, H, O, Ash, MS, Bed):.4f}}")
+'''
+    with open(os.path.join(script_dir, f"predict_{model_name}_{target}.py"), 'w', encoding='utf-8') as f:
+        f.write(script_content)
+
+
+def run_cv_comparison(df: pd.DataFrame, target: str, models: List[GAMModelWrapper], 
+                     n_folds: int = 5, use_bayesian_opt: bool = True) -> Tuple[pd.DataFrame, BayesianOptimizer]:
+    print(f"\n{'='*60}\nTarget: {target}\n{'='*60}")
+    df_target = split_target(df, target)
+    if len(df_target) < 50:
+        print(f"Warning: Only {len(df_target)} samples")
+        return pd.DataFrame(), None
+    
+    scaler_full = fit_scaler(df_target)
+    X_full = transform_features(df_target, scaler_full)
+    y_full = df_target[target].values
+    
+    optimizer = None
+    if use_bayesian_opt and CFG.USE_BAYESIAN_OPT:
+        print(f"\n  [Bayesian Optimization] Running {CFG.OPTUNA_N_TRIALS} trials per model...")
+        optimizer = BayesianOptimizer(n_trials=CFG.OPTUNA_N_TRIALS, cv_folds=CFG.OPTUNA_CV_FOLDS, random_state=CFG.RANDOM_STATE)
+        for model in models:
+            print(f"    Optimizing {model.name}...", end=" ")
+            try:
+                best_params, best_score = optimizer.optimize(model, X_full, y_full, target)
+                print(f"RMSE={best_score:.4f}" if best_params else "defaults")
+            except Exception as e:
+                print(f"ERROR: {e}")
+    
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=CFG.RANDOM_STATE)
+    results = []
+    
+    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(df_target)):
+        print(f"\n--- Fold {fold_idx + 1}/{n_folds} ---")
+        df_train, df_test = df_target.iloc[train_idx], df_target.iloc[test_idx]
+        scaler = fit_scaler(df_train)
+        X_train, X_test = transform_features(df_train, scaler), transform_features(df_test, scaler)
+        y_train, y_test = df_train[target].values, df_test[target].values
+        
+        for model in models:
+            print(f"  {model.name}...", end=" ")
+            try:
+                model_fresh = optimizer.get_optimized_model(model) if optimizer else model.clone()
+                model_fresh.fit(X_train, y_train, target=target)
+                
+                # Test set metrics
+                y_pred_test = model_fresh.predict(X_test)
+                metrics_test = compute_metrics(y_test, y_pred_test)
+                phys_rate_test, _ = check_physical_conformity(model_fresh, X_test, target)
+                
+                # Train set metrics
+                y_pred_train = model_fresh.predict(X_train)
+                metrics_train = compute_metrics(y_train, y_pred_train)
+                phys_rate_train, _ = check_physical_conformity(model_fresh, X_train, target)
+                
+                # Combine all metrics
+                metrics = {
+                    "Model": model.name, 
+                    "Target": target, 
+                    "Fold": fold_idx + 1,
+                    "FitTime": model_fresh.fit_time,
+                    # Test metrics
+                    "Test_RMSE": metrics_test['RMSE'],
+                    "Test_R2": metrics_test['R2'],
+                    "Test_MAE": metrics_test['MAE'],
+                    "Test_MAPE": metrics_test['MAPE'],
+                    "Test_PhysRate": phys_rate_test,
+                    # Train metrics
+                    "Train_RMSE": metrics_train['RMSE'],
+                    "Train_R2": metrics_train['R2'],
+                    "Train_MAE": metrics_train['MAE'],
+                    "Train_MAPE": metrics_train['MAPE'],
+                    "Train_PhysRate": phys_rate_train,
+                    # Legacy columns for compatibility
+                    "RMSE": metrics_test['RMSE'],
+                    "R2": metrics_test['R2'],
+                    "MAE": metrics_test['MAE'],
+                    "MAPE": metrics_test['MAPE'],
+                    "PhysRate": phys_rate_test,
+                }
+                print(f"Test: RMSE={metrics_test['RMSE']:.4f}, R2={metrics_test['R2']:.4f}, Phys={phys_rate_test:.1f}% | Train: R2={metrics_train['R2']:.4f}")
+                results.append(metrics)
+            except Exception as e:
+                print(f"ERROR: {e}")
+                results.append({"Model": model.name, "Target": target, "Fold": fold_idx + 1, 
+                               "RMSE": np.nan, "MAE": np.nan, "R2": np.nan, "MAPE": np.nan, 
+                               "FitTime": np.nan, "PhysRate": np.nan,
+                               "Test_RMSE": np.nan, "Test_R2": np.nan, "Test_MAE": np.nan, 
+                               "Test_MAPE": np.nan, "Test_PhysRate": np.nan,
+                               "Train_RMSE": np.nan, "Train_R2": np.nan, "Train_MAE": np.nan,
+                               "Train_MAPE": np.nan, "Train_PhysRate": np.nan})
+    
+    return pd.DataFrame(results), optimizer
+
+
+def train_final_models(df: pd.DataFrame, target: str, models: List[GAMModelWrapper], 
+                      save_dir: str, optimizer: BayesianOptimizer = None) -> Dict[str, GAMModelWrapper]:
+    """Train final models with train/test scatter plot."""
+    print(f"\n  Training final models for {target}...")
+    df_target = split_target(df, target)
+    
+    # Use 80-20 split for final visualization
+    n_train = int(len(df_target) * 0.8)
+    indices = np.random.permutation(len(df_target))
+    train_idx, test_idx = indices[:n_train], indices[n_train:]
+    
+    df_train = df_target.iloc[train_idx]
+    df_test = df_target.iloc[test_idx]
+    
+    scaler = fit_scaler(df_train)
+    X_train = transform_features(df_train, scaler)
+    X_test = transform_features(df_test, scaler)
+    y_train = df_train[target].values
+    y_test = df_test[target].values
+    
+    trained = {}
+    
+    for model in models:
+        print(f"    {model.name}...", end=" ")
+        try:
+            model_fresh = optimizer.get_optimized_model(model) if optimizer else model.clone()
+            model_fresh.fit(X_train, y_train, target=target)
+            
+            y_pred_train = model_fresh.predict(X_train)
+            y_pred_test = model_fresh.predict(X_test)
+            
+            trained[model.name] = model_fresh
+            save_model_and_scaler(model_fresh, scaler, target, save_dir)
+            generate_prediction_script(model.name, target, save_dir)
+            plot_feature_importance(model_fresh, save_dir, target)
+            
+            # Plot scatter with train/test distinction
+            plot_prediction_scatter_train_test(y_train, y_pred_train, y_test, y_pred_test,
+                                               model.name, target, save_dir)
+            plot_residuals(y_test, y_pred_test, model.name, target, save_dir)
+            print("OK")
+        except Exception as e:
+            print(f"ERROR: {e}")
+    
+    return trained
+
+
+def aggregate_results(df_results: pd.DataFrame) -> pd.DataFrame:
+    agg = df_results.groupby(["Target", "Model"]).agg({
+        "RMSE": ["mean", "std"], "MAE": ["mean", "std"], "R2": ["mean", "std"],
+        "MAPE": ["mean", "std"], "PhysRate": ["mean", "std"], "FitTime": ["mean"],
+    }).round(4)
+    agg.columns = ["_".join(col).strip() for col in agg.columns.values]
+    return agg.reset_index()
+
+
+def main():
+    set_seed(CFG.RANDOM_STATE)
+    ensure_dir(CFG.OUTPUT_DIR)
+    
+    print("="*60)
+    print("Multi-GAM Model Comparison Study")
+    print("(With and Without Monotonic Constraints)")
+    print("="*60)
+    
+    print("\n[1] Loading data...")
+    df = load_and_prepare_data()
+    
+    print("\n[2] Checking available models...")
+    models = get_available_models(include_monotonic=True)
+    if not models:
+        print("ERROR: No models available.")
+        return
+    print(f"\n{len(models)} model variants available")
+    
+    print("\n[3] Running cross-validation...")
+    all_results = []
+    all_optimizers = {}
+    for target in TARGETS:
+        df_results, optimizer = run_cv_comparison(df, target, models, n_folds=CFG.N_FOLDS, use_bayesian_opt=CFG.USE_BAYESIAN_OPT)
+        if not df_results.empty:
+            all_results.append(df_results)
+        if optimizer:
+            all_optimizers[target] = optimizer
+    
+    if not all_results:
+        print("ERROR: No results.")
+        return
+    
+    df_all = pd.concat(all_results, ignore_index=True)
+    df_all.to_excel(os.path.join(CFG.OUTPUT_DIR, "cv_results_raw.xlsx"), index=False)
+    
+    print("\n[4] Aggregating results...")
+    df_agg = aggregate_results(df_all)
+    df_agg.to_excel(os.path.join(CFG.OUTPUT_DIR, "cv_results_aggregated.xlsx"), index=False)
+    
+    for target, optimizer in all_optimizers.items():
+        target_dir = os.path.join(CFG.OUTPUT_DIR, target)
+        ensure_dir(target_dir)
+        optimizer.save_results(target_dir)
+    
+    print("\n[5] Training final models...")
+    for target in TARGETS:
+        target_dir = os.path.join(CFG.OUTPUT_DIR, target)
+        ensure_dir(target_dir)
+        train_final_models(df, target, models, target_dir, all_optimizers.get(target))
+    
+    print("\n[6] Generating comparison plots...")
+    for target in TARGETS:
+        plot_comparison_boxplot(df_all, target, CFG.OUTPUT_DIR)
+    plot_overall_heatmap(df_agg, "RMSE", CFG.OUTPUT_DIR)
+    plot_overall_heatmap(df_agg, "R2", CFG.OUTPUT_DIR)
+    plot_overall_heatmap(df_agg, "PhysRate", CFG.OUTPUT_DIR)
+    
+    generate_best_model_analysis(df_all, df, models, CFG.OUTPUT_DIR)
+    
+    print("\n" + "="*60)
+    print("SUMMARY: Mean RMSE (sorted)")
+    print("="*60)
+    summary = df_agg.pivot(index="Model", columns="Target", values="RMSE_mean")
+    summary["Avg"] = summary.mean(axis=1)
+    print(summary.sort_values("Avg").round(4).to_string())
+    
+    print("\n" + "="*60)
+    print("SUMMARY: Mean $R^2$ (sorted)")
+    print("="*60)
+    summary_r2 = df_agg.pivot(index="Model", columns="Target", values="R2_mean")
+    summary_r2["Avg"] = summary_r2.mean(axis=1)
+    print(summary_r2.sort_values("Avg", ascending=False).round(4).to_string())
+    
+    print("\n" + "="*60)
+    print("SUMMARY: Mean PhysRate [%] (sorted)")
+    print("="*60)
+    summary_phys = df_agg.pivot(index="Model", columns="Target", values="PhysRate_mean")
+    summary_phys["Avg"] = summary_phys.mean(axis=1)
+    print(summary_phys.sort_values("Avg", ascending=False).round(2).to_string())
+    
+    # Generate comprehensive fold-level summary table
+    print("\n[8] Generating comprehensive fold-level summary...")
+    generate_comprehensive_fold_summary(df_all, CFG.OUTPUT_DIR)
+    
+    print("\n" + "="*60)
+    print(f"Complete! Results saved to: {CFG.OUTPUT_DIR}/")
+    print("="*60)
+
+
+def generate_comprehensive_fold_summary(df_all: pd.DataFrame, save_dir: str) -> None:
+    """
+    Generate a comprehensive summary table with Train/Test metrics for each model, 
+    target, and fold. Exports to Excel with multiple sheets.
+    """
+    ensure_dir(save_dir)
+    
+    # Define columns for the summary
+    summary_cols = [
+        "Model", "Target", "Fold",
+        "Train_R2", "Train_RMSE", "Train_PhysRate",
+        "Test_R2", "Test_RMSE", "Test_PhysRate",
+        "FitTime"
+    ]
+    
+    # Filter available columns
+    available_cols = [c for c in summary_cols if c in df_all.columns]
+    df_summary = df_all[available_cols].copy()
+    
+    # Round numeric columns
+    numeric_cols = ["Train_R2", "Train_RMSE", "Train_PhysRate", "Test_R2", "Test_RMSE", "Test_PhysRate", "FitTime"]
+    for col in numeric_cols:
+        if col in df_summary.columns:
+            df_summary[col] = df_summary[col].round(4)
+    
+    # Save comprehensive summary
+    summary_path = os.path.join(save_dir, "comprehensive_fold_summary.xlsx")
+    
+    with pd.ExcelWriter(summary_path, engine="openpyxl") as writer:
+        # Sheet 1: All data combined
+        df_summary.to_excel(writer, sheet_name="All_Folds", index=False)
+        
+        # Sheet 2-6: Per-target sheets
+        for target in TARGETS:
+            df_target = df_summary[df_summary["Target"] == target].copy()
+            if not df_target.empty:
+                df_target.to_excel(writer, sheet_name=target, index=False)
+        
+        # Sheet 7: Aggregated statistics per model per target
+        agg_data = []
+        for target in TARGETS:
+            df_t = df_all[df_all["Target"] == target]
+            for model in df_t["Model"].unique():
+                df_m = df_t[df_t["Model"] == model]
+                row = {
+                    "Model": model,
+                    "Target": target,
+                    "N_Folds": len(df_m),
+                    "Train_R2_mean": df_m["Train_R2"].mean() if "Train_R2" in df_m.columns else np.nan,
+                    "Train_R2_std": df_m["Train_R2"].std() if "Train_R2" in df_m.columns else np.nan,
+                    "Train_RMSE_mean": df_m["Train_RMSE"].mean() if "Train_RMSE" in df_m.columns else np.nan,
+                    "Train_RMSE_std": df_m["Train_RMSE"].std() if "Train_RMSE" in df_m.columns else np.nan,
+                    "Train_PhysRate_mean": df_m["Train_PhysRate"].mean() if "Train_PhysRate" in df_m.columns else np.nan,
+                    "Test_R2_mean": df_m["Test_R2"].mean() if "Test_R2" in df_m.columns else np.nan,
+                    "Test_R2_std": df_m["Test_R2"].std() if "Test_R2" in df_m.columns else np.nan,
+                    "Test_RMSE_mean": df_m["Test_RMSE"].mean() if "Test_RMSE" in df_m.columns else np.nan,
+                    "Test_RMSE_std": df_m["Test_RMSE"].std() if "Test_RMSE" in df_m.columns else np.nan,
+                    "Test_PhysRate_mean": df_m["Test_PhysRate"].mean() if "Test_PhysRate" in df_m.columns else np.nan,
+                }
+                agg_data.append(row)
+        
+        df_agg_full = pd.DataFrame(agg_data)
+        for col in df_agg_full.columns:
+            if df_agg_full[col].dtype in [np.float64, np.float32]:
+                df_agg_full[col] = df_agg_full[col].round(4)
+        df_agg_full.to_excel(writer, sheet_name="Aggregated_Stats", index=False)
+    
+    print(f"    Comprehensive fold summary saved to: {summary_path}")
+
+if __name__ == "__main__":
+    main()
