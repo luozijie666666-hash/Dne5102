@@ -1,215 +1,113 @@
-# GAMs
-gam_comparison_study.py# Multi-GAM Model Comparison for Biomass GasificationA comprehensive framework for comparing variants of Generalized Additive Models (GAMs) (with/without monotonic constraints) on biomass gasification data, focusing on regression performance, physical consistency, and interpretability.
+Multi-GAM Model Comparison for Biomass Gasification
+(With and Without Monotonic Constraints)
+This project implements a comprehensive comparison of 10 variants of Generalized Additive Models (GAMs) (5 base GAM models + their monotonic constrained versions) for predictive modeling of biomass gasification processes. The core focus is on balancing predictive accuracy, physical conformity (alignment with chemical engineering physical laws), and model interpretability for key gasification output variables.
 Project Overview
-This repository implements a systematic comparison of 10 variants of Generalized Additive Models (5 base GAM models × 2 versions: standard/monotonic constrained) for regression tasks on biomass gasification datasets. The core goals include:
-Evaluate regression performance of different GAM models on key gasification targets (H₂, CO, CO₂, CH₄, gas yield GY).
-Verify physical consistency of model predictions (aligning with domain knowledge, e.g., temperature's monotonic impact on H₂).
-Compare model interpretability (feature importance) and training efficiency.
-Provide publication-quality visualizations and structured result outputs.
-Key Features
-End-to-end data pipeline: Excel data loading, categorical feature encoding, outlier filtering, feature standardization.
-Support for 5 base GAM models (EBM, pyGAM, GA2M, NAM, GAMM) and their monotonic-constrained variants.
-Bayesian hyperparameter optimization (Optuna) for model tuning (optional).
-Multi-dimensional evaluation: RMSE/MAE/R²/MAPE (regression), physical conformity rate, training time.
-Publication-ready visualizations: feature importance, prediction scatter plots, residual analysis, model comparison boxplots/heatmaps.
-Structured result saving (Excel/PNG/PDF) for reproducibility.
+The study aims to evaluate the performance of state-of-the-art GAM-based models in predicting critical biomass gasification outputs (H₂, CO, CO₂, CH₄, and gas yield GY). Monotonic constraints are integrated into each model to enforce compliance with the physical trends of the gasification process, addressing the issue of physically inconsistent predictions from pure data-driven models. The project includes full-automated pipelines for data preprocessing, 5-fold cross-validation, model training, performance evaluation, publication-quality visualization, and optimal model selection.
+Models Compared
+5 base GAM models with two versions each (standard + monotonic constrained) for a total of 10 model variants:
+表格
+Base Model	Monotonic Version	Abbreviation	Dependencies/Libraries	Key Characteristics
+Explainable Boosting Machine	EBM with Monotonic Constraints	EBM/EBM_Mono	interpret (InterpretML)	Glassbox model, additive structure, high interpretability
+Classical GAM with Splines	pyGAM with Monotonic Constraints	pyGAM/pyGAM_Mono	pygam	Traditional spline-based GAM, flexible non-linear fitting
+GA²M (GAMs with Pairwise Interactions)	GA2M with Monotonic Constraints	GA2M/GA2M_Mono	interpret (InterpretML)	EBM extension with pairwise feature interactions
+Neural Additive Models	NAM with Monotonic Constraints	NAM/NAM_Mono	torch (PyTorch)	Neural network-based additive model, combines deep learning with interpretability
+Generalized Additive Mixed Models	GAMM with Monotonic Constraints	GAMM/GAMM_Mono	pygam	GAM extension with random intercepts for categorical features
 Environment Setup
-Prerequisites
-Python version: 3.8 ~ 3.10 (compatibility with older packages is recommended)
-CUDA (optional): For accelerating NAM model training with GPU (Torch GPU version)
-Step 1: Create Virtual Environment (Recommended)
+Dependencies
+Install all required Python packages via pip:
 bash
 运行
-# Using Conda (Anaconda/Miniconda required)
-conda create -n gam_gasification python=3.9
-conda activate gam_gasification
-
-# Or using venv
-python -m venv gam_gasification
-# Windows activation: gam_gasification\Scripts\activate
-# Linux/Mac activation: source gam_gasification/bin/activate
-Step 2: Install Dependencies
-Install core dependencies:
-bash
-运行
-pip install pandas numpy matplotlib scipy scikit-learn joblib openpyxl
-pip install interpret pygam torch
-Install optional dependency (Bayesian hyperparameter optimization):
-bash
-运行
-pip install optuna
+pip install numpy pandas scikit-learn matplotlib pygam interpret torch scipy openpyxl joblib seaborn
+Python Version: 3.8+ recommended
+GPU Support: Optional (for NAM model acceleration, requires CUDA-enabled PyTorch)
 Data Preparation
-Prepare the biomass gasification dataset in Excel format (default filename: Data of biomass gasification.xlsx).
-The Excel file must contain two sheets:
-data of %: Features (temperature, ER, Steam/Biomass, C/H/O/Ash/Moisture, Bed material) and gas composition targets (H₂/CO/CO₂/CH₄, unit: %vol N₂ free).
-data of GY: Same features as above + gas yield target (GY, unit: Nm³/kg daf).
-Ensure the feature columns match the naming convention in CFG class (adjust CFG in code if your column names differ):
-Temperature (T): Convert to Kelvin (code auto-converts °C to K).
-Categorical feature: Bed material (values: 1/2/3/4, auto-converted to one-hot dummies).
+Input Data File
+The project uses a single Excel file: Data of biomass gasification.xlsx (configured in the CFG.DATA_PATH parameter) with two sheets:
+data of %: Contains molar concentration data for H₂, CO, CO₂, CH₄ (N₂ free, vol%)
+data of GY: Contains gas yield (GY) data (Nm³/kg daf)
+Features & Target Variables
+Predictor Features
+8 Continuous Features: T [K], ER [-], Steam/Biomass (S/B) [-], C [wt%], H [wt%], O [wt%], Ash [wt%], Moisture [wt%]
+1 Categorical Feature: Bed material (4 categories, one-hot encoded to Bed_1/Bed_2/Bed_3/Bed_4)
+Target Variables
+H₂, CO, CO₂, CH₄ (all vol% N₂ free), and GY (Nm³/kg daf) — the core output metrics of biomass gasification.
+Data Preprocessing Pipeline
+The project automatically executes the following preprocessing steps:
+Sheet merging and column renaming
+Unit conversion (temperature from °C to K)
+One-hot encoding for categorical bed material
+Z-score outlier filtering (threshold = 5.0)
+Standardization (Z-score) for continuous features
+Target-wise data splitting (removal of NaN/infinite values)
 How to Run
-1. Configure Parameters (Optional)
-Modify the CFG class in gam_comparison_study.py to adjust key settings:
+Place the biomass gasification Excel data file in the project root directory (matching CFG.DATA_PATH)
+Run the main script directly:
 python
 运行
-class CFG:
-    DATA_PATH = "Data of biomass gasification.xlsx"  # Path to your Excel data
-    OUTPUT_DIR = "results_gam_comparison"            # Result save directory
-    N_FOLDS = 5                                      # K-fold cross-validation
-    RANDOM_STATE = 42                                # Random seed for reproducibility
-    OPTUNA_N_TRIALS = 30                             # Optuna trial number (if enabled)
-    USE_BAYESIAN_OPT = False                         # Enable/disable hyperparameter optimization
-2. Execute the Code
-Run the main script directly:
-bash
-运行
-python gam_comparison_study.py
-Output Results
-All results are saved to the directory specified by CFG.OUTPUT_DIR (default: results_gam_comparison), including:
-1. Numerical Results (Excel)
-Model evaluation metrics (RMSE/MAE/R²/MAPE/physical conformity rate) across folds/targets.
-Feature importance scores for each model/target.
-Bayesian optimization results (best hyperparameters + RMSE, if enabled).
-Prediction vs. actual values for train/test sets.
-2. Visualizations (PNG/PDF)
-Visualization Type	Description
-Feature Importance Bar Chart	Relative importance of each feature for a model/target.
-Prediction Scatter Plot	Train/test predicted vs. measured values (with R²/RMSE annotations).
-Residual Analysis	Residual vs. predicted values + residual distribution (normal fit).
-Model Comparison Boxplot	Distribution of RMSE/R²/physical conformity across models for each target.
-Performance Heatmap	Aggregated metric (mean RMSE/R²) across models/targets (publication-ready).
-Model Descriptions
-The framework compares 10 model variants (5 base models × standard/monotonic constrained):
-Base Model	Full Name	Monotonic Variant	Key Notes
-EBM	Explainable Boosting Machine	EBM_Mono	Glassbox model (InterpretML)
-pyGAM	Classical GAM with splines	pyGAM_Mono	Spline-based additive model (pyGAM)
-GA2M	GAM with Pairwise Interactions	GA2M_Mono	EBM variant with feature interactions
-NAM	Neural Additive Models	NAM_Mono	Neural network-based additive model (Torch)
-GAMM	Generalized Additive Mixed Models	GAMM_Mono	GAM + random intercept (pyGAM extension)
-Monotonic Constraints
-Monotonic variants apply domain-specific constraints (e.g., temperature ↑ → H₂ ↑, ER ↑ → CO ↓) to ensure predictions align with physical laws of biomass gasification. The constraint logic is defined in get_constraints_vector().
-Evaluation Metrics
-Metric	Description
-RMSE	Root Mean Squared Error (lower = better)
-MAE	Mean Absolute Error (lower = better)
-R²	Coefficient of Determination (1 = perfect prediction)
-MAPE	Mean Absolute Percentage Error (lower = better)
-Physical Rate	Percentage of samples satisfying monotonic constraints (100% = fully conform)
-Fit Time	Model training time (lower = more efficient)
-References
-Lou, Y., et al. (2012). Intelligible Models for Classification and Regression. KDD 2012.
-Lou, Y., et al. (2013). Accurate Intelligible Models with Pairwise Interactions. KDD 2013.
-Hastie, T., & Tibshirani, R. (1990). Generalized Additive Models. Chapman & Hall.
-Agarwal, R., et al. (2021). Neural Additive Models: Interpretable Machine Learning with Neural Nets. NeurIPS 2021.
-License
-This project is intended for academic/research use only. For commercial use, please contact the authors.
-Notes
-Ensure all dependencies are installed correctly (missing packages will skip corresponding models with a [SKIP] log).
-For large datasets, NAM model training may be slower on CPU—enable CUDA for GPU acceleration.
-Adjust matplotlib rcParams in the code to customize visualization styles for publications.# Multi-GAM Model Comparison for Biomass Gasification
-A comprehensive framework for comparing variants of Generalized Additive Models (GAMs) (with/without monotonic constraints) on biomass gasification data, focusing on regression performance, physical consistency, and interpretability.
-Project Overview
-This repository implements a systematic comparison of 10 variants of Generalized Additive Models (5 base GAM models × 2 versions: standard/monotonic constrained) for regression tasks on biomass gasification datasets. The core goals include:
-Evaluate regression performance of different GAM models on key gasification targets (H₂, CO, CO₂, CH₄, gas yield GY).
-Verify physical consistency of model predictions (aligning with domain knowledge, e.g., temperature's monotonic impact on H₂).
-Compare model interpretability (feature importance) and training efficiency.
-Provide publication-quality visualizations and structured result outputs.
+python gam_comparison_biomass_gasification.py
+All experimental parameters are configurable via the CFG class:
+N_FOLDS: 5-fold cross-validation (default)
+RANDOM_STATE: 42 (for reproducibility)
+OUTPUT_DIR: results_gam_comparison (default output directory)
+TARGETS_MAP: Maps target abbreviations to full names/units
 Key Features
-End-to-end data pipeline: Excel data loading, categorical feature encoding, outlier filtering, feature standardization.
-Support for 5 base GAM models (EBM, pyGAM, GA2M, NAM, GAMM) and their monotonic-constrained variants.
-Bayesian hyperparameter optimization (Optuna) for model tuning (optional).
-Multi-dimensional evaluation: RMSE/MAE/R²/MAPE (regression), physical conformity rate, training time.
-Publication-ready visualizations: feature importance, prediction scatter plots, residual analysis, model comparison boxplots/heatmaps.
-Structured result saving (Excel/PNG/PDF) for reproducibility.
-Environment Setup
-Prerequisites
-Python version: 3.8 ~ 3.10 (compatibility with older packages is recommended)
-CUDA (optional): For accelerating NAM model training with GPU (Torch GPU version)
-Step 1: Create Virtual Environment (Recommended)
-bash
-运行
-# Using Conda (Anaconda/Miniconda required)
-conda create -n gam_gasification python=3.9
-conda activate gam_gasification
-
-# Or using venv
-python -m venv gam_gasification
-# Windows activation: gam_gasification\Scripts\activate
-# Linux/Mac activation: source gam_gasification/bin/activate
-Step 2: Install Dependencies
-Install core dependencies:
-bash
-运行
-pip install pandas numpy matplotlib scipy scikit-learn joblib openpyxl
-pip install interpret pygam torch
-Install optional dependency (Bayesian hyperparameter optimization):
-bash
-运行
-pip install optuna
-Data Preparation
-Prepare the biomass gasification dataset in Excel format (default filename: Data of biomass gasification.xlsx).
-The Excel file must contain two sheets:
-data of %: Features (temperature, ER, Steam/Biomass, C/H/O/Ash/Moisture, Bed material) and gas composition targets (H₂/CO/CO₂/CH₄, unit: %vol N₂ free).
-data of GY: Same features as above + gas yield target (GY, unit: Nm³/kg daf).
-Ensure the feature columns match the naming convention in CFG class (adjust CFG in code if your column names differ):
-Temperature (T): Convert to Kelvin (code auto-converts °C to K).
-Categorical feature: Bed material (values: 1/2/3/4, auto-converted to one-hot dummies).
-How to Run
-1. Configure Parameters (Optional)
-Modify the CFG class in gam_comparison_study.py to adjust key settings:
-python
-运行
-class CFG:
-    DATA_PATH = "Data of biomass gasification.xlsx"  # Path to your Excel data
-    OUTPUT_DIR = "results_gam_comparison"            # Result save directory
-    N_FOLDS = 5                                      # K-fold cross-validation
-    RANDOM_STATE = 42                                # Random seed for reproducibility
-    OPTUNA_N_TRIALS = 30                             # Optuna trial number (if enabled)
-    USE_BAYESIAN_OPT = False                         # Enable/disable hyperparameter optimization
-2. Execute the Code
-Run the main script directly:
-bash
-运行
-python gam_comparison_study.py
-Output Results
-All results are saved to the directory specified by CFG.OUTPUT_DIR (default: results_gam_comparison), including:
-1. Numerical Results (Excel)
-Model evaluation metrics (RMSE/MAE/R²/MAPE/physical conformity rate) across folds/targets.
-Feature importance scores for each model/target.
-Bayesian optimization results (best hyperparameters + RMSE, if enabled).
-Prediction vs. actual values for train/test sets.
-2. Visualizations (PNG/PDF)
-Visualization Type	Description
-Feature Importance Bar Chart	Relative importance of each feature for a model/target.
-Prediction Scatter Plot	Train/test predicted vs. measured values (with R²/RMSE annotations).
-Residual Analysis	Residual vs. predicted values + residual distribution (normal fit).
-Model Comparison Boxplot	Distribution of RMSE/R²/physical conformity across models for each target.
-Performance Heatmap	Aggregated metric (mean RMSE/R²) across models/targets (publication-ready).
-Model Descriptions
-The framework compares 10 model variants (5 base models × standard/monotonic constrained):
-Base Model	Full Name	Monotonic Variant	Key Notes
-EBM	Explainable Boosting Machine	EBM_Mono	Glassbox model (InterpretML)
-pyGAM	Classical GAM with splines	pyGAM_Mono	Spline-based additive model (pyGAM)
-GA2M	GAM with Pairwise Interactions	GA2M_Mono	EBM variant with feature interactions
-NAM	Neural Additive Models	NAM_Mono	Neural network-based additive model (Torch)
-GAMM	Generalized Additive Mixed Models	GAMM_Mono	GAM + random intercept (pyGAM extension)
-Monotonic Constraints
-Monotonic variants apply domain-specific constraints (e.g., temperature ↑ → H₂ ↑, ER ↑ → CO ↓) to ensure predictions align with physical laws of biomass gasification. The constraint logic is defined in get_constraints_vector().
-Evaluation Metrics
-Metric	Description
-RMSE	Root Mean Squared Error (lower = better)
-MAE	Mean Absolute Error (lower = better)
-R²	Coefficient of Determination (1 = perfect prediction)
-MAPE	Mean Absolute Percentage Error (lower = better)
-Physical Rate	Percentage of samples satisfying monotonic constraints (100% = fully conform)
-Fit Time	Model training time (lower = more efficient)
+1. Multi-Metric Performance Evaluation
+Models are evaluated on both train and test sets with the following metrics:
+Regression accuracy: RMSE, MAE, R²
+Relative error: MAPE (%)
+Physical conformity: PhysRate (%) — the percentage of samples complying with pre-defined physical monotonic constraints
+2. Physical Conformity Check
+A custom physical consistency validation module (check_physical_conformity) verifies if model predictions follow the physical trends of biomass gasification (e.g., temperature positively correlates with H₂ yield). Monotonic constraints are defined per target variable via get_constraints_vector.
+3. Publication-Quality Visualization
+The project generates both PNG and PDF formats for all visualizations with a standardized publication-style plot configuration (Times New Roman font, consistent color scheme, professional axis styling). Key visualizations include:
+Feature importance bar plots
+Train/test prediction scatter plots (with perfect prediction line and ±10% error bands)
+Residual analysis (residual vs. predicted + normal distribution fit)
+Model comparison boxplots (RMSE, R², PhysRate)
+Heatmaps for cross-model/target metric comparison
+Feature shape functions (marginal effect of each feature on the target)
+ICE/PDP plots (Individual Conditional Expectation / Partial Dependence Plots)
+3D bivariate dependency surface plots (all 28 pairs of continuous features)
+4. Model Deployment Utilities
+Trained models and feature scalers are saved via joblib in the saved_models subdirectory
+Auto-generated prediction scripts (predict_<model>_<target>.py) for standalone model inference
+Inference supports direct input of raw feature values (automatic scaling/one-hot encoding)
+5. Optimal Model Auto-Analysis
+The project automatically identifies the best model for each target variable (highest PhysRate ≥99.9% + highest R²) and generates advanced interpretability visualizations (shape functions, ICE/PDP, 3D bivariate plots) for the optimal model.
+6. Reproducible Results
+Fixed random seed for all stochastic operations
+5-fold cross-validation with stratified shuffling
+Comprehensive raw/aggregated result tables (Excel format)
+Full logging of model training/fitting time and error messages
+Output Structure
+All results are saved to the results_gam_comparison directory (configurable) with the following structure:
+plaintext
+results_gam_comparison/
+├── cv_results_raw.xlsx          # Raw 5-fold cross-validation results
+├── cv_results_aggregated.xlsx   # Aggregated (mean/std) model performance metrics
+├── comprehensive_fold_summary.xlsx # Full train/test metric summary (per fold/target/model)
+├── heatmap_*.png/pdf            # Cross-model/target heatmaps (RMSE, R², PhysRate)
+├── *.comparison_boxplot.png/pdf # Target-wise model comparison boxplots
+├── [H2/CO/CO2/CH4/GY]/          # Target-specific subdirectories
+│   ├── saved_models/            # Trained models and scalers (joblib)
+│   ├── prediction_scripts/      # Standalone prediction scripts
+│   ├── *.feature_importance.png/pdf/xlsx
+│   ├── *.scatter.png/pdf/xlsx
+│   ├── *.residuals.png/pdf
+│   ├── *.shape_functions.png/pdf/xlsx
+│   ├── *.ice_pdp.png/pdf/xlsx
+│   └── best_model_analysis/     # Advanced analysis for the optimal model
+│       └── bivariate_3d/        # 3D bivariate dependency plots
+└── ...
 References
-Lou, Y., et al. (2012). Intelligible Models for Classification and Regression. KDD 2012.
-Lou, Y., et al. (2013). Accurate Intelligible Models with Pairwise Interactions. KDD 2013.
+The models and methodologies are based on the following key publications:
+Lou, Y., Caruana, R., & Gehrke, J. (2012). Intelligible Models for Classification and Regression. KDD 2012.
+Lou, Y., Caruana, R., & Hooker, G. (2013). Accurate Intelligible Models with Pairwise Interactions. KDD 2013.
 Hastie, T., & Tibshirani, R. (1990). Generalized Additive Models. Chapman & Hall.
 Agarwal, R., et al. (2021). Neural Additive Models: Interpretable Machine Learning with Neural Nets. NeurIPS 2021.
-License
-This project is intended for academic/research use only. For commercial use, please contact the authors.
 Notes
-Ensure all dependencies are installed correctly (missing packages will skip corresponding models with a [SKIP] log).
-For large datasets, NAM model training may be slower on CPU—enable CUDA for GPU acceleration.
-Adjust matplotlib rcParams in the code to customize visualization styles for publications.
+Monotonic Constraints for GY: No physical constraints are applied to the GY target variable (no authoritative physical trend reports available).
+Model Compatibility Check: The script automatically checks for installed dependencies and skips models with missing libraries (with clear logging).
+GPU Acceleration: The NAM model uses PyTorch and automatically leverages CUDA if available (falls back to CPU otherwise).
+Visualization Customization: Plot styles (font, color, size, DPI) are fully configurable via the mpl.rcParams section in the script.
+Scalability: The pipeline supports easy extension to additional target variables/features by modifying the CFG class and TARGETS/CONTINUOUS_COLS parameters.
