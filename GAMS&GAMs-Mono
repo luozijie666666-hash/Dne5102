@@ -939,7 +939,7 @@ def plot_ice_pdp(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler,
 
 
 def plot_bivariate_3d(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler,
-                     target: str, save_dir: str) -> None:
+                     target: str, save_dir: str, top_pairs: int = 4) -> None:
     """
     Plot 3D surface plots for bivariate dependencies.
     Generates C(8,2)=28 independent plots for all pairs of 8 continuous features.
@@ -1059,18 +1059,14 @@ def generate_best_model_analysis(df_results: pd.DataFrame, df: pd.DataFrame,
         best_dir = os.path.join(save_dir, target, "best_model_analysis")
         ensure_dir(best_dir)
         
-        # Skip interpretability plots for GY (no physical constraints, no authoritative trends)
-        if target == "GY":
-            print(f"    Skipping interpretability plots for GY (no physical constraints)")
-        else:
-            print(f"    Generating shape functions...")
-            plot_shape_functions(best_model, X, scaler, target, best_dir)
-            
-            print(f"    Generating ICE/PDP plots...")
-            plot_ice_pdp(best_model, X, scaler, target, best_dir)
-            
-            print(f"    Generating 3D bivariate dependency plots...")
-            plot_bivariate_3d(best_model, X, scaler, target, best_dir)
+        print(f"    Generating shape functions...")
+        plot_shape_functions(best_model, X, scaler, target, best_dir)
+        
+        print(f"    Generating ICE/PDP plots...")
+        plot_ice_pdp(best_model, X, scaler, target, best_dir)
+        
+        print(f"    Generating 3D bivariate dependency plots...")
+        plot_bivariate_3d(best_model, X, scaler, target, best_dir)
         
         pd.DataFrame([{"Target": target, "Best_Model": best_model_name, "R2": best_r2, "PhysRate": best_phys}]).to_excel(
             os.path.join(best_dir, "best_model_info.xlsx"), index=False)
@@ -1409,6 +1405,7 @@ def generate_comprehensive_fold_summary(df_all: pd.DataFrame, save_dir: str) -> 
         df_agg_full.to_excel(writer, sheet_name="Aggregated_Stats", index=False)
     
     print(f"    Comprehensive fold summary saved to: {summary_path}")
+
 
 if __name__ == "__main__":
     main()
