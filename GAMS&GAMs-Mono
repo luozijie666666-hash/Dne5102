@@ -1,5 +1,5 @@
 """
-Multi-GAM Model Comparison Study for Biomass Gasification
+Multi-GAM Models Comparison Study for Biomass Gasification
 (With and Without Monotonic Constraints)
 
 Models Compared (5 base GAM models x 2 versions = 10 model variants):
