@@ -619,8 +619,13 @@ def plot_feature_importance(model: GAMModelWrapper, save_dir: str, target: str) 
 
 def plot_prediction_scatter_train_test(y_train: np.ndarray, y_pred_train: np.ndarray, 
                                        y_test: np.ndarray, y_pred_test: np.ndarray,
-                                       model_name: str, target: str, save_dir: str) -> pd.DataFrame:
-    """Plot prediction scatter with train/test distinction and both R² values."""
+                                       model_name: str, target: str, save_dir: str,
+                                       fold_label: str = None) -> pd.DataFrame:
+    """Plot prediction scatter with train/test distinction and both R² values.
+    
+    Args:
+        fold_label: optional string appended to the plot title, e.g. "(Best CV Fold 3)".
+    """
     fig, ax = plt.subplots(figsize=(4.5, 4.5))
     
     # Plot training data (blue, more transparent)
@@ -661,10 +666,11 @@ def plot_prediction_scatter_train_test(y_train: np.ndarray, y_pred_train: np.nda
     ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=9, verticalalignment='top',
             bbox=props, family='serif')
     
+    _title = f'{model_name}' + (f'\n{fold_label}' if fold_label else '')
     setup_publication_axes(ax, 
                           xlabel=f'Measured {TARGET_UNITS.get(target, target)}',
                           ylabel=f'Predicted {TARGET_UNITS.get(target, target)}',
-                          title=f'{model_name}')
+                          title=_title)
     
     ax.legend(loc='lower right', fontsize=8, framealpha=0.95, markerscale=0.8)
     
@@ -1126,15 +1132,25 @@ if __name__ == "__main__":
 
 
 def run_cv_comparison(df: pd.DataFrame, target: str, models: List[GAMModelWrapper], 
-                     n_folds: int = 5) -> pd.DataFrame:
+                     n_folds: int = 5) -> Tuple[pd.DataFrame, Dict[str, Dict]]:
+    """Run CV comparison and return results DataFrame plus best-fold prediction data for scatter plots.
+    
+    Returns:
+        df_results: DataFrame with per-fold metrics
+        best_fold_preds: dict keyed by model_name, each value is a dict with keys:
+            y_train, y_pred_train, y_test, y_pred_test, fold (best fold index, 1-based)
+    """
     print(f"\n{'='*60}\nTarget: {target}\n{'='*60}")
     df_target = split_target(df, target)
     if len(df_target) < 50:
         print(f"Warning: Only {len(df_target)} samples")
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
     
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=CFG.RANDOM_STATE)
     results = []
+    
+    # Track best fold per model: {model_name: {"r2": best_r2, "data": {...}}}
+    best_fold_tracker: Dict[str, Dict] = {}
     
     for fold_idx, (train_idx, test_idx) in enumerate(kf.split(df_target)):
         print(f"\n--- Fold {fold_idx + 1}/{n_folds} ---")
@@ -1158,6 +1174,18 @@ def run_cv_comparison(df: pd.DataFrame, target: str, models: List[GAMModelWrappe
                 y_pred_train = model_fresh.predict(X_train)
                 metrics_train = compute_metrics(y_train, y_pred_train)
                 phys_rate_train, _ = check_physical_conformity(model_fresh, X_train, target)
+                
+                # Track best fold by Test R²
+                current_r2 = metrics_test['R2']
+                if model.name not in best_fold_tracker or current_r2 > best_fold_tracker[model.name]["r2"]:
+                    best_fold_tracker[model.name] = {
+                        "r2": current_r2,
+                        "fold": fold_idx + 1,
+                        "y_train": y_train.copy(),
+                        "y_pred_train": y_pred_train.copy(),
+                        "y_test": y_test.copy(),
+                        "y_pred_test": y_pred_test.copy(),
+                    }
                 
                 # Combine all metrics
                 metrics = {
@@ -1196,49 +1224,81 @@ def run_cv_comparison(df: pd.DataFrame, target: str, models: List[GAMModelWrappe
                                "Train_RMSE": np.nan, "Train_R2": np.nan, "Train_MAE": np.nan,
                                "Train_MAPE": np.nan, "Train_PhysRate": np.nan})
     
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), best_fold_tracker
 
 
 def train_final_models(df: pd.DataFrame, target: str, models: List[GAMModelWrapper], 
-                      save_dir: str) -> Dict[str, GAMModelWrapper]:
-    """Train final models with train/test scatter plot."""
+                      save_dir: str,
+                      best_fold_preds: Dict[str, Dict] = None) -> Dict[str, GAMModelWrapper]:
+    """Train final models. Scatter plots use the best CV fold's data for each model.
+    
+    Args:
+        df: full dataset
+        target: target variable name
+        models: list of model wrappers
+        save_dir: directory to save outputs
+        best_fold_preds: dict returned by run_cv_comparison, keyed by model_name,
+            containing best-fold prediction arrays. If None or a model is missing,
+            falls back to a fresh 80-20 split.
+    """
     print(f"\n  Training final models for {target}...")
     df_target = split_target(df, target)
     
-    # Use 80-20 split for final visualization
+    # Prepare a fallback 80-20 split (used only if best_fold_preds is unavailable)
     n_train = int(len(df_target) * 0.8)
     indices = np.random.permutation(len(df_target))
-    train_idx, test_idx = indices[:n_train], indices[n_train:]
-    
-    df_train = df_target.iloc[train_idx]
-    df_test = df_target.iloc[test_idx]
-    
-    scaler = fit_scaler(df_train)
-    X_train = transform_features(df_train, scaler)
-    X_test = transform_features(df_test, scaler)
-    y_train = df_train[target].values
-    y_test = df_test[target].values
+    train_idx_fb, test_idx_fb = indices[:n_train], indices[n_train:]
+    df_train_fb = df_target.iloc[train_idx_fb]
+    df_test_fb  = df_target.iloc[test_idx_fb]
+    scaler_fb   = fit_scaler(df_train_fb)
+    X_train_fb  = transform_features(df_train_fb, scaler_fb)
+    X_test_fb   = transform_features(df_test_fb,  scaler_fb)
+    y_train_fb  = df_train_fb[target].values
+    y_test_fb   = df_test_fb[target].values
     
     trained = {}
     
     for model in models:
         print(f"    {model.name}...", end=" ")
         try:
-            model_fresh = model.clone()
-            model_fresh.fit(X_train, y_train, target=target)
+            # ---- Determine which data to use for scatter plot ----
+            if best_fold_preds and model.name in best_fold_preds:
+                bp = best_fold_preds[model.name]
+                y_train_sc     = bp["y_train"]
+                y_pred_train_sc = bp["y_pred_train"]
+                y_test_sc      = bp["y_test"]
+                y_pred_test_sc = bp["y_pred_test"]
+                best_fold_num  = bp["fold"]
+                scatter_note   = f"best CV fold ({best_fold_num})"
+            else:
+                # Fallback: train a fresh model on the 80-20 split
+                model_temp = model.clone()
+                model_temp.fit(X_train_fb, y_train_fb, target=target)
+                y_train_sc      = y_train_fb
+                y_pred_train_sc = model_temp.predict(X_train_fb)
+                y_test_sc       = y_test_fb
+                y_pred_test_sc  = model_temp.predict(X_test_fb)
+                scatter_note    = "80-20 split (fallback)"
             
-            y_pred_train = model_fresh.predict(X_train)
-            y_pred_test = model_fresh.predict(X_test)
+            print(f"[scatter: {scatter_note}]", end=" ")
+            
+            # ---- Train a full-data model for saving / feature importance / shape fns ----
+            # Use the full 80-20 fallback split for saving (same as before)
+            model_fresh = model.clone()
+            model_fresh.fit(X_train_fb, y_train_fb, target=target)
             
             trained[model.name] = model_fresh
-            save_model_and_scaler(model_fresh, scaler, target, save_dir)
+            save_model_and_scaler(model_fresh, scaler_fb, target, save_dir)
             generate_prediction_script(model.name, target, save_dir)
             plot_feature_importance(model_fresh, save_dir, target)
             
-            # Plot scatter with train/test distinction
-            plot_prediction_scatter_train_test(y_train, y_pred_train, y_test, y_pred_test,
-                                               model.name, target, save_dir)
-            plot_residuals(y_test, y_pred_test, model.name, target, save_dir)
+            # Plot scatter using best-fold (or fallback) data
+            _fold_label = f"(Best CV Fold {best_fold_num})" if (best_fold_preds and model.name in best_fold_preds) else "(80-20 split)"
+            plot_prediction_scatter_train_test(y_train_sc, y_pred_train_sc,
+                                               y_test_sc,  y_pred_test_sc,
+                                               model.name, target, save_dir,
+                                               fold_label=_fold_label)
+            plot_residuals(y_test_sc, y_pred_test_sc, model.name, target, save_dir)
             print("OK")
         except Exception as e:
             print(f"ERROR: {e}")
@@ -1276,10 +1336,12 @@ def main():
     
     print("\n[3] Running cross-validation...")
     all_results = []
+    best_fold_preds_all: Dict[str, Dict] = {}  # {target: {model_name: best_fold_data}}
     for target in TARGETS:
-        df_results = run_cv_comparison(df, target, models, n_folds=CFG.N_FOLDS)
+        df_results, best_fold_preds = run_cv_comparison(df, target, models, n_folds=CFG.N_FOLDS)
         if not df_results.empty:
             all_results.append(df_results)
+        best_fold_preds_all[target] = best_fold_preds
     
     if not all_results:
         print("ERROR: No results.")
@@ -1292,11 +1354,12 @@ def main():
     df_agg = aggregate_results(df_all)
     df_agg.to_excel(os.path.join(CFG.OUTPUT_DIR, "cv_results_aggregated.xlsx"), index=False)
     
-    print("\n[5] Training final models...")
+    print("\n[5] Training final models (scatter plots use best CV fold per model)...")
     for target in TARGETS:
         target_dir = os.path.join(CFG.OUTPUT_DIR, target)
         ensure_dir(target_dir)
-        train_final_models(df, target, models, target_dir)
+        train_final_models(df, target, models, target_dir,
+                           best_fold_preds=best_fold_preds_all.get(target, {}))
     
     print("\n[6] Generating comparison plots...")
     for target in TARGETS:
