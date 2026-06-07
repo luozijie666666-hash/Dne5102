@@ -2,12 +2,11 @@
 Multi-GAM Models Comparison Study for Biomass Gasification
 (With and Without Monotonic Constraints)
 
-Models Compared (5 base GAM models x 2 versions = 10 model variants):
+Models Compared (4 base GAM models x 2 versions = 8 model variants):
 1. EBM / EBM_Mono - Explainable Boosting Machine (InterpretML)
 2. pyGAM / pyGAM_Mono - Classical GAM with splines
 3. GA2M / GA2M_Mono - GA^2M with pairwise interactions
 4. NAM / NAM_Mono - Neural Additive Models
-5. GAMM / GAMM_Mono - Generalized Additive Mixed Models
 
 References:
 - Lou et al. (2012). Intelligible Models for Classification and Regression. KDD 2012.
@@ -469,73 +468,6 @@ class NAMWrapper(GAMModelWrapper):
         return NAMWrapper(monotonic=self.monotonic, hidden_units=self.hidden_units, epochs=self.epochs, lr=self.lr)
 
 
-class GAMMWrapper(GAMModelWrapper):
-    def __init__(self, monotonic: bool = False, n_splines: int = 15, lam: float = 0.6, random_intercept: bool = True):
-        super().__init__(name="GAMM_Mono" if monotonic else "GAMM", monotonic=monotonic)
-        self.n_splines = n_splines
-        self.lam = lam
-        self.random_intercept = random_intercept
-        self._random_effects = None
-        self._gam_model = None
-    
-    def _build_model(self, target: str = None) -> Any:
-        return self
-    
-    def fit(self, X: np.ndarray, y: np.ndarray, target: str = None) -> 'GAMMWrapper':
-        from pygam import LinearGAM, s, l
-        self.target = target
-        start = time.time()
-        constraints_vec = get_constraints_vector(target) if self.monotonic and target else [0]*len(FEATURE_COLUMNS)
-        terms = None
-        for i in range(N_CONTINUOUS):
-            c = constraints_vec[i]
-            if c > 0:
-                term = s(i, n_splines=self.n_splines, lam=self.lam, constraints='monotonic_inc')
-            elif c < 0:
-                term = s(i, n_splines=self.n_splines, lam=self.lam, constraints='monotonic_dec')
-            else:
-                term = s(i, n_splines=self.n_splines, lam=self.lam)
-            terms = term if terms is None else terms + term
-        for i in range(N_CONTINUOUS, len(FEATURE_COLUMNS)):
-            terms = terms + l(i)
-        self._gam_model = LinearGAM(terms)
-        self._gam_model.fit(X, y)
-        if self.random_intercept:
-            residuals = y - self._gam_model.predict(X)
-            self._random_effects = {}
-            for bed_idx in range(4):
-                col_idx = N_CONTINUOUS + bed_idx
-                mask = X[:, col_idx] == 1
-                if np.sum(mask) > 0:
-                    self._random_effects[bed_idx] = float(np.mean(residuals[mask]))
-                else:
-                    self._random_effects[bed_idx] = 0.0
-        self.model = self
-        self.fit_time = time.time() - start
-        self.is_fitted = True
-        return self
-    
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        pred = self._gam_model.predict(X)
-        if self.random_intercept and self._random_effects:
-            for bed_idx in range(4):
-                col_idx = N_CONTINUOUS + bed_idx
-                mask = X[:, col_idx] == 1
-                if np.sum(mask) > 0:
-                    pred[mask] += self._random_effects.get(bed_idx, 0.0)
-        return pred
-    
-    def clone(self) -> 'GAMMWrapper':
-        return GAMMWrapper(monotonic=self.monotonic, n_splines=self.n_splines, lam=self.lam, random_intercept=self.random_intercept)
-    
-    def get_feature_importance(self) -> Dict[str, float]:
-        try:
-            edof = self._gam_model.statistics_['edof_per_feature']
-            return {FEATURE_COLUMNS[i]: float(edof[i]) for i in range(len(FEATURE_COLUMNS))}
-        except:
-            return {}
-
-
 def get_available_models(include_monotonic: bool = True) -> List[GAMModelWrapper]:
     available = []
     model_configs = [
@@ -543,7 +475,6 @@ def get_available_models(include_monotonic: bool = True) -> List[GAMModelWrapper
         (PyGAMWrapper, "pygam", {"monotonic": False}),
         (GA2MWrapper, "interpret", {"monotonic": False}),
         (NAMWrapper, "torch", {"monotonic": False}),
-        (GAMMWrapper, "pygam", {"monotonic": False}),
     ]
     if include_monotonic:
         model_configs.extend([
@@ -551,7 +482,6 @@ def get_available_models(include_monotonic: bool = True) -> List[GAMModelWrapper
             (PyGAMWrapper, "pygam", {"monotonic": True}),
             (GA2MWrapper, "interpret", {"monotonic": True}),
             (NAMWrapper, "torch", {"monotonic": True}),
-            (GAMMWrapper, "pygam", {"monotonic": True}),
         ])
     for model_cls, package, kwargs in model_configs:
         try:
@@ -848,9 +778,9 @@ def plot_shape_functions(model: GAMModelWrapper, X: np.ndarray, scaler: Standard
                                       ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
                 all_data.append({"Feature": feat_name, "X_values": list(x_orig), "Y_values": list(y_centered)})
                 
-    elif base_name in ["pyGAM", "GAMM"]:
+    elif base_name == "pyGAM":
         try:
-            gam_model = model._gam_model if base_name == "GAMM" else model.model
+            gam_model = model.model
             for i in range(N_CONTINUOUS):
                 ax = axes[i]
                 feat_name = CONTINUOUS_COLS[i]
@@ -865,7 +795,7 @@ def plot_shape_functions(model: GAMModelWrapper, X: np.ndarray, scaler: Standard
                                       ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
                 all_data.append({"Feature": feat_name, "X_values": x_orig.tolist(), "Y_values": pdep.tolist()})
         except Exception as e:
-            print(f"    Shape functions error (pyGAM/GAMM): {e}")
+            print(f"    Shape functions error (pyGAM): {e}")
     else:
         # Manual partial dependence for NAM and others
         for i in range(N_CONTINUOUS):
