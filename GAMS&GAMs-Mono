@@ -16,6 +16,7 @@ References:
 """
 
 import os
+import shutil
 import random
 import warnings
 import numpy as np
@@ -30,13 +31,15 @@ warnings.filterwarnings("ignore")
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d import Axes3D
 
 plt.style.use('seaborn-v0_8-whitegrid')
 
 mpl.rcParams.update({
-    "font.family": "serif",
-    "font.serif": ["Times New Roman", "DejaVu Serif", "serif"],
+    "font.family": "DejaVu Serif",
+    "font.serif": ["DejaVu Serif"],
     "font.size": 10,
     "axes.labelsize": 11,
     "axes.titlesize": 12,
@@ -81,7 +84,10 @@ mpl.rcParams.update({
     "legend.borderpad": 0.4,
     "legend.labelspacing": 0.3,
     "legend.handlelength": 1.5,
-    "mathtext.fontset": "stix",
+    "mathtext.fontset": "dejavuserif",
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "svg.fonttype": "none",
 })
 
 COLORS = ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', '#F39B7F', '#8491B4', '#91D1C2', '#DC0000']
@@ -524,28 +530,220 @@ def setup_publication_axes(ax, xlabel=None, ylabel=None, title=None):
     return ax
 
 
-def plot_feature_importance(model: GAMModelWrapper, save_dir: str, target: str) -> pd.DataFrame:
-    importance = model.get_feature_importance()
-    if not importance:
-        return pd.DataFrame()
-    sorted_items = sorted(importance.items(), key=lambda x: abs(x[1]), reverse=True)
-    names, values = [x[0] for x in sorted_items], [x[1] for x in sorted_items]
-    fig, ax = plt.subplots(figsize=(4.5, 3.5))
-    colors = [COLORS[i % len(COLORS)] for i in range(len(names))]
-    ax.barh(range(len(names)), values, color=colors, edgecolor='black', linewidth=0.5, height=0.7)
-    ax.set_yticks(range(len(names)))
-    ax.set_yticklabels(names, fontsize=9)
-    setup_publication_axes(ax, xlabel='Relative Importance', title=f'{model.name} ({target})')
-    ax.invert_yaxis()
+def _unwrap_ebm(model: GAMModelWrapper):
+    """Return the fitted InterpretML EBM object from a model wrapper."""
+    return model.model if hasattr(model, "model") else model
+
+
+def _get_ebm_term_features(ebm) -> List[Tuple[int, ...]]:
+    """Return the feature-index tuple associated with each EBM term."""
+    term_features = getattr(ebm, "term_features_", None)
+    if term_features is None:
+        raise AttributeError(
+            "The fitted ExplainableBoostingRegressor does not expose term_features_. "
+            "Please use a recent InterpretML version."
+        )
+    return [tuple(int(v) for v in term) for term in term_features]
+
+
+def _eval_ebm_terms(ebm, X: np.ndarray) -> np.ndarray:
+    """
+    Evaluate the contribution of every fitted EBM/GA2M term for each sample.
+
+    The preferred API is eval_terms. predict_and_contrib is retained as a
+    compatibility fallback for older InterpretML releases.
+    """
+    X = np.asarray(X, dtype=float)
+    term_features = _get_ebm_term_features(ebm)
+
+    if hasattr(ebm, "eval_terms"):
+        values = np.asarray(ebm.eval_terms(X), dtype=float)
+    elif hasattr(ebm, "predict_and_contrib"):
+        output = ebm.predict_and_contrib(X)
+        if not isinstance(output, tuple) or len(output) < 2:
+            raise RuntimeError("Unexpected predict_and_contrib output from InterpretML.")
+        values = np.asarray(output[1], dtype=float)
+    else:
+        raise AttributeError(
+            "The fitted ExplainableBoostingRegressor exposes neither eval_terms "
+            "nor predict_and_contrib."
+        )
+
+    if values.ndim != 2:
+        raise RuntimeError(f"Expected a 2-D term-contribution array, got shape {values.shape}.")
+
+    n_terms = len(term_features)
+    if values.shape[1] == n_terms + 1:
+        # Some older APIs append an intercept contribution.
+        values = values[:, :n_terms]
+    if values.shape[1] != n_terms:
+        raise RuntimeError(
+            f"Term-contribution columns ({values.shape[1]}) do not match "
+            f"term_features_ ({n_terms})."
+        )
+    return values
+
+
+def _format_term_name(term: Tuple[int, ...]) -> str:
+    return " x ".join(FEATURE_COLUMNS[idx].replace("Steam/Biomass", "S/B") for idx in term)
+
+
+def _target_contribution_label(target: str, prefix: str = "Contribution") -> str:
+    if target in {"H2", "CO", "CO2", "CH4"}:
+        return f"{prefix} [vol% N$_2$ free]"
+    if target == "GY":
+        return f"{prefix} [Nm$^3$/kg daf]"
+    return prefix
+
+
+def _get_term_importance_table(model: GAMModelWrapper, X: np.ndarray) -> pd.DataFrame:
+    """
+    Compute mean absolute term contributions on the supplied observations.
+
+    This ranking is internally consistent across main-effect and pairwise terms
+    of the same fitted GA2M/EBM model and is used only for interpretation.
+    """
+    ebm = _unwrap_ebm(model)
+    term_features = _get_ebm_term_features(ebm)
+    term_values = _eval_ebm_terms(ebm, X)
+    importance = np.mean(np.abs(term_values), axis=0)
+
+    rows = []
+    for term_idx, (term, score) in enumerate(zip(term_features, importance)):
+        rows.append({
+            "TermIndex": term_idx,
+            "Term": _format_term_name(term),
+            "TermType": "Main effect" if len(term) == 1 else "Pairwise interaction",
+            "FeatureIndices": term,
+            "Importance": float(score),
+        })
+    return pd.DataFrame(rows).sort_values("Importance", ascending=False).reset_index(drop=True)
+
+
+def plot_feature_importance(model: GAMModelWrapper, save_dir: str, target: str,
+                            X: np.ndarray = None, top_n: int = 15) -> pd.DataFrame:
+    """Plot publication-quality main-effect and pairwise-term importance."""
+    ensure_dir(save_dir)
+
+    if X is not None and model.name.replace("_Mono", "") in {"EBM", "GA2M"}:
+        df = _get_term_importance_table(model, X)
+    else:
+        importance = model.get_feature_importance()
+        if not importance:
+            return pd.DataFrame()
+        rows = []
+        for name, value in importance.items():
+            normalized = str(name).replace(" & ", " x ")
+            rows.append({
+                "TermIndex": np.nan,
+                "Term": normalized,
+                "TermType": "Pairwise interaction" if " x " in normalized else "Main effect",
+                "FeatureIndices": None,
+                "Importance": float(abs(value)),
+            })
+        df = pd.DataFrame(rows).sort_values("Importance", ascending=False).reset_index(drop=True)
+
+    df_plot = df.head(min(top_n, len(df))).copy().iloc[::-1]
+    if df_plot.empty:
+        return df
+
+    palette = {
+        "Main effect": COLORS[3],
+        "Pairwise interaction": COLORS[0],
+    }
+    bar_colors = [palette.get(term_type, COLORS[3]) for term_type in df_plot["TermType"]]
+
+    fig_height = max(4.0, 0.34 * len(df_plot) + 1.4)
+    fig, ax = plt.subplots(figsize=(6.2, fig_height))
+    y_pos = np.arange(len(df_plot))
+    ax.barh(
+        y_pos,
+        df_plot["Importance"].to_numpy(),
+        color=bar_colors,
+        edgecolor="black",
+        linewidth=0.45,
+        height=0.68,
+    )
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(df_plot["Term"], fontsize=9)
+    ax.set_xlabel("Mean absolute term contribution", fontsize=10)
+    ax.set_title(f"{model.name} term importance: {target}", fontsize=11, fontweight="bold", pad=8)
     ax.set_xlim(left=0)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_feature_importance.png"), dpi=300, bbox_inches='tight', facecolor='white')
-    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_feature_importance.pdf"), bbox_inches='tight', facecolor='white')
-    plt.close()
-    df = pd.DataFrame({"Feature": names, "Importance": values})
-    df.to_excel(os.path.join(save_dir, f"{model.name}_{target}_feature_importance.xlsx"), index=False)
+    ax.grid(axis="x", linestyle="--", linewidth=0.45, alpha=0.35)
+    ax.grid(axis="y", visible=False)
+    ax.tick_params(which="both", direction="in", top=False, right=False)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    present_types = list(dict.fromkeys(df_plot["TermType"].tolist()))
+    handles = [Patch(facecolor=palette[t], edgecolor="black", linewidth=0.45, label=t)
+               for t in present_types if t in palette]
+    if handles:
+        ax.legend(handles=handles, loc="lower right", frameon=False, fontsize=8)
+
+    fig.tight_layout()
+    stem = os.path.join(save_dir, f"{model.name}_{target}_feature_importance")
+    fig.savefig(stem + ".png", dpi=600, bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".pdf", bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".svg", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    export_df = df.copy()
+    export_df["FeatureIndices"] = export_df["FeatureIndices"].apply(
+        lambda value: ",".join(map(str, value)) if isinstance(value, (tuple, list, np.ndarray)) else ""
+    )
+    export_df.to_excel(stem + ".xlsx", index=False)
     return df
 
+
+def plot_feature_importance_summary(feature_tables: Dict[str, pd.DataFrame],
+                                    save_dir: str, top_n: int = 12) -> None:
+    """Create the four-target feature-importance figure used in the manuscript."""
+    targets = [t for t in ["H2", "CO", "CO2", "CH4"] if t in feature_tables]
+    if not targets:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.2, 8.0))
+    axes = axes.flatten()
+    palette = {"Main effect": COLORS[3], "Pairwise interaction": COLORS[0]}
+
+    for panel_idx, target in enumerate(targets):
+        ax = axes[panel_idx]
+        df_plot = feature_tables[target].head(top_n).copy().iloc[::-1]
+        y_pos = np.arange(len(df_plot))
+        colors = [palette.get(t, COLORS[3]) for t in df_plot["TermType"]]
+        ax.barh(y_pos, df_plot["Importance"], color=colors, edgecolor="black",
+                linewidth=0.4, height=0.68)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(df_plot["Term"], fontsize=8)
+        ax.set_xlabel("Mean absolute term contribution", fontsize=9)
+        ax.set_title(f"({chr(97 + panel_idx)}) {target}", loc="left",
+                     fontsize=10.5, fontweight="bold")
+        ax.set_xlim(left=0)
+        ax.grid(axis="x", linestyle="--", linewidth=0.4, alpha=0.3)
+        ax.grid(axis="y", visible=False)
+        ax.tick_params(which="both", direction="in", top=False, right=False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    for idx in range(len(targets), len(axes)):
+        axes[idx].axis("off")
+
+    handles = [
+        Patch(facecolor=palette["Main effect"], edgecolor="black", linewidth=0.4, label="Main effect"),
+        Patch(facecolor=palette["Pairwise interaction"], edgecolor="black", linewidth=0.4,
+              label="Pairwise interaction"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=False,
+               bbox_to_anchor=(0.5, -0.005), fontsize=9)
+    fig.tight_layout(rect=[0, 0.035, 1, 1])
+
+    ensure_dir(save_dir)
+    stem = os.path.join(save_dir, "Fig_feature_importance_GA2M_Mono_four_targets")
+    fig.savefig(stem + ".png", dpi=600, bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".pdf", bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".svg", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
 
 def plot_prediction_scatter_train_test(y_train: np.ndarray, y_pred_train: np.ndarray, 
                                        y_test: np.ndarray, y_pred_test: np.ndarray,
@@ -704,310 +902,682 @@ def plot_overall_heatmap(df_agg: pd.DataFrame, metric: str, save_dir: str) -> No
     pivot.to_excel(os.path.join(save_dir, f"heatmap_{metric}.xlsx"))
 
 
-def plot_shape_functions(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler, 
-                        target: str, save_dir: str) -> pd.DataFrame:
-    """Plot shape functions with original scale x-axis."""
+def _make_feature_grid(X: np.ndarray, feature_idx: int, n_grid: int) -> np.ndarray:
+    """Create a grid spanning the observed standardized range of one feature."""
+    return np.linspace(float(np.min(X[:, feature_idx])), float(np.max(X[:, feature_idx])), n_grid)
+
+
+def _add_observation_rug(ax, x_values: np.ndarray) -> None:
+    """Add a compact rug plot without changing the y-axis scale materially."""
+    y_min, y_max = ax.get_ylim()
+    y_pos = y_min + 0.025 * (y_max - y_min if y_max > y_min else 1.0)
+    ax.plot(x_values, np.full_like(x_values, y_pos), "|", color="black",
+            markersize=3.2, markeredgewidth=0.45, alpha=0.22, clip_on=True)
+
+
+def plot_shape_functions(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler,
+                         target: str, save_dir: str, n_grid: int = 120) -> pd.DataFrame:
+    """
+    Plot centered main-effect functions of the selected additive model.
+
+    For EBM/GA2M, the main-effect terms are evaluated directly and centered by
+    their mean contribution over the observed samples. This avoids mixing main
+    effects with pairwise terms or other fixed-input contributions.
+    """
     ensure_dir(save_dir)
-    all_data = []
     base_name = model.name.replace("_Mono", "")
-    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+    records = []
+    fig, axes = plt.subplots(2, 4, figsize=(12.8, 6.6))
     axes = axes.flatten()
-    
-    if base_name in ["EBM", "GA2M"]:
-        try:
-            ebm_global = model.model.explain_global()
-            data_dict = ebm_global.data()
-            for i in range(N_CONTINUOUS):
-                ax = axes[i]
-                feat_name = CONTINUOUS_COLS[i]
-                if feat_name in data_dict['names']:
-                    idx = data_dict['names'].index(feat_name)
-                    # EBM stores data in different format
-                    if 'left_names' in data_dict and idx < len(data_dict['left_names']):
-                        x_vals_scaled = np.array(data_dict['left_names'][idx])
-                        y_vals = np.array(data_dict['scores'][idx])
-                    else:
-                        # Fallback: compute via partial dependence
-                        x_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 50)
-                        y_vals = []
-                        X_base = X.mean(axis=0)
-                        for xv in x_scaled:
-                            X_temp = np.tile(X_base, (1, 1))
-                            X_temp[0, i] = xv
-                            y_vals.append(model.predict(X_temp)[0])
-                        x_vals_scaled = x_scaled
-                        y_vals = np.array(y_vals) - np.mean(y_vals)
-                else:
-                    x_vals_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 50)
-                    y_vals = []
-                    X_base = X.mean(axis=0)
-                    for xv in x_vals_scaled:
-                        X_temp = np.tile(X_base, (1, 1))
-                        X_temp[0, i] = xv
-                        y_vals.append(model.predict(X_temp)[0])
-                    y_vals = np.array(y_vals) - np.mean(y_vals)
-                
-                # Convert to original scale
-                x_vals_orig = inverse_transform_feature(scaler, i, np.array(x_vals_scaled).flatten())
-                y_vals = np.array(y_vals).flatten()
-                
-                ax.plot(x_vals_orig, y_vals, color=COLORS[0], lw=1.5)
-                ax.fill_between(x_vals_orig, 0, y_vals, alpha=0.2, color=COLORS[0])
-                ax.axhline(y=0, color='gray', linestyle='--', lw=0.8, alpha=0.6)
-                setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name), 
-                                      ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
-                all_data.append({"Feature": feat_name, "X_values": list(x_vals_orig), "Y_values": list(y_vals)})
-        except Exception as e:
-            print(f"    Shape functions error (EBM/GA2M): {e}")
-            # Fallback to manual partial dependence
-            for i in range(N_CONTINUOUS):
-                ax = axes[i]
-                feat_name = CONTINUOUS_COLS[i]
-                x_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 50)
-                y_vals = []
-                for xv in x_scaled:
-                    X_temp = X.copy()
-                    X_temp[:, i] = xv
-                    y_vals.append(np.mean(model.predict(X_temp)))
-                y_centered = np.array(y_vals) - np.mean(y_vals)
-                x_orig = inverse_transform_feature(scaler, i, x_scaled)
-                ax.plot(x_orig, y_centered, color=COLORS[0], lw=1.5)
-                ax.fill_between(x_orig, 0, y_centered, alpha=0.2, color=COLORS[0])
-                ax.axhline(y=0, color='gray', linestyle='--', lw=0.8, alpha=0.6)
-                setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name),
-                                      ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
-                all_data.append({"Feature": feat_name, "X_values": list(x_orig), "Y_values": list(y_centered)})
-                
-    elif base_name == "pyGAM":
-        try:
-            gam_model = model.model
-            for i in range(N_CONTINUOUS):
-                ax = axes[i]
-                feat_name = CONTINUOUS_COLS[i]
-                XX = gam_model.generate_X_grid(term=i, n=100)
-                pdep, confi = gam_model.partial_dependence(term=i, X=XX, width=0.95)
-                x_scaled = XX[:, i]
-                x_orig = inverse_transform_feature(scaler, i, x_scaled)
-                ax.plot(x_orig, pdep, color=COLORS[0], lw=1.5)
-                ax.fill_between(x_orig, confi[:, 0], confi[:, 1], alpha=0.2, color=COLORS[0])
-                ax.axhline(y=0, color='gray', linestyle='--', lw=0.8, alpha=0.6)
-                setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name),
-                                      ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
-                all_data.append({"Feature": feat_name, "X_values": x_orig.tolist(), "Y_values": pdep.tolist()})
-        except Exception as e:
-            print(f"    Shape functions error (pyGAM): {e}")
+
+    if base_name in {"EBM", "GA2M"}:
+        ebm = _unwrap_ebm(model)
+        term_features = _get_ebm_term_features(ebm)
+        main_term_map = {term[0]: term_idx for term_idx, term in enumerate(term_features) if len(term) == 1}
+        observed_terms = _eval_ebm_terms(ebm, X)
+
+        for feature_idx in range(N_CONTINUOUS):
+            ax = axes[feature_idx]
+            feature_name = CONTINUOUS_COLS[feature_idx]
+            if feature_idx not in main_term_map:
+                ax.axis("off")
+                continue
+
+            term_idx = main_term_map[feature_idx]
+            x_scaled = _make_feature_grid(X, feature_idx, n_grid)
+            x_original = inverse_transform_feature(scaler, feature_idx, x_scaled)
+            baseline = float(np.mean(observed_terms[:, term_idx]))
+
+            X_batch = np.repeat(X[np.newaxis, :, :], n_grid, axis=0)
+            X_batch[:, :, feature_idx] = x_scaled[:, np.newaxis]
+            term_batch = _eval_ebm_terms(ebm, X_batch.reshape(-1, X.shape[1]))
+            contribution = term_batch[:, term_idx].reshape(n_grid, X.shape[0]).mean(axis=1) - baseline
+
+            ax.plot(x_original, contribution, color=COLORS[0], linewidth=1.8)
+            ax.fill_between(x_original, 0, contribution, color=COLORS[0], alpha=0.16, linewidth=0)
+            ax.axhline(0, color="black", linestyle="--", linewidth=0.75, alpha=0.65)
+            ax.set_xlabel(FEATURE_UNITS.get(feature_name, feature_name))
+            ax.set_ylabel(_target_contribution_label(target, "Main-effect contribution"), fontsize=9)
+            ax.set_title(f"({chr(97 + feature_idx)}) {feature_name.replace('Steam/Biomass', 'S/B')}",
+                         loc="left", fontsize=10.5, fontweight="bold")
+            ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.28)
+            ax.tick_params(which="both", direction="in", top=True, right=True)
+            _add_observation_rug(ax, inverse_transform_feature(scaler, feature_idx, X[:, feature_idx]))
+
+            for xv, yv in zip(x_original, contribution):
+                records.append({
+                    "Target": target,
+                    "Feature": feature_name,
+                    "X": float(xv),
+                    "MainEffectContribution": float(yv),
+                })
     else:
-        # Manual partial dependence for NAM and others
-        for i in range(N_CONTINUOUS):
-            ax = axes[i]
-            feat_name = CONTINUOUS_COLS[i]
-            x_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 50)
-            y_vals = []
+        # Compatibility fallback for non-EBM additive models.
+        for feature_idx in range(N_CONTINUOUS):
+            ax = axes[feature_idx]
+            feature_name = CONTINUOUS_COLS[feature_idx]
+            x_scaled = _make_feature_grid(X, feature_idx, n_grid)
+            x_original = inverse_transform_feature(scaler, feature_idx, x_scaled)
+            predictions = []
             for xv in x_scaled:
                 X_temp = X.copy()
-                X_temp[:, i] = xv
-                y_vals.append(np.mean(model.predict(X_temp)))
-            y_centered = np.array(y_vals) - np.mean(y_vals)
-            x_orig = inverse_transform_feature(scaler, i, x_scaled)
-            ax.plot(x_orig, y_centered, color=COLORS[0], lw=1.5)
-            ax.fill_between(x_orig, 0, y_centered, alpha=0.2, color=COLORS[0])
-            ax.axhline(y=0, color='gray', linestyle='--', lw=0.8, alpha=0.6)
-            setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name),
-                                  ylabel=f'$f$({feat_name})', title=f'({chr(97+i)}) {feat_name}')
-            all_data.append({"Feature": feat_name, "X_values": x_orig.tolist(), "Y_values": y_centered.tolist()})
-    
-    fig.suptitle(f'{model.name} Shape Functions - {TARGET_UNITS.get(target, target)}', fontsize=12, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_shape_functions.png"), dpi=300, bbox_inches='tight', facecolor='white')
-    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_shape_functions.pdf"), bbox_inches='tight', facecolor='white')
-    plt.close()
-    df = pd.DataFrame(all_data)
-    df.to_excel(os.path.join(save_dir, f"{model.name}_{target}_shape_functions.xlsx"), index=False)
+                X_temp[:, feature_idx] = xv
+                predictions.append(float(np.mean(model.predict(X_temp))))
+            contribution = np.asarray(predictions) - np.mean(predictions)
+            ax.plot(x_original, contribution, color=COLORS[0], linewidth=1.8)
+            ax.fill_between(x_original, 0, contribution, color=COLORS[0], alpha=0.16, linewidth=0)
+            ax.axhline(0, color="black", linestyle="--", linewidth=0.75, alpha=0.65)
+            ax.set_xlabel(FEATURE_UNITS.get(feature_name, feature_name))
+            ax.set_ylabel(_target_contribution_label(target, "Centered response"), fontsize=9)
+            ax.set_title(f"({chr(97 + feature_idx)}) {feature_name.replace('Steam/Biomass', 'S/B')}",
+                         loc="left", fontsize=10.5, fontweight="bold")
+            ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.28)
+            ax.tick_params(which="both", direction="in", top=True, right=True)
+            _add_observation_rug(ax, inverse_transform_feature(scaler, feature_idx, X[:, feature_idx]))
+            for xv, yv in zip(x_original, contribution):
+                records.append({
+                    "Target": target,
+                    "Feature": feature_name,
+                    "X": float(xv),
+                    "MainEffectContribution": float(yv),
+                })
+
+    fig.suptitle(f"{model.name} main-effect functions: {target}", fontsize=12,
+                 fontweight="bold", y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
+    stem = os.path.join(save_dir, f"{model.name}_{target}_shape_functions")
+    fig.savefig(stem + ".png", dpi=600, bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".pdf", bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".svg", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    df = pd.DataFrame(records)
+    df.to_excel(stem + ".xlsx", index=False)
     return df
 
 
 def plot_ice_pdp(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler,
-                target: str, save_dir: str, n_ice_lines: int = 50) -> pd.DataFrame:
-    """Plot ICE/PDP with original scale x-axis."""
+                 target: str, save_dir: str, n_ice_lines: int = 50,
+                 n_grid: int = 60) -> Dict[str, pd.DataFrame]:
+    """
+    Plot ICE curves for a reproducible sample and PDP curves averaged over all observations.
+
+    A local random generator with the unchanged global seed is used only for selecting
+    displayed ICE lines; it does not alter the random state used by model training.
+    """
     ensure_dir(save_dir)
-    all_data = []
-    n_samples = min(n_ice_lines, X.shape[0])
-    sample_indices = np.random.choice(X.shape[0], n_samples, replace=False)
-    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+    rng = np.random.default_rng(CFG.RANDOM_STATE)
+    n_display = min(n_ice_lines, X.shape[0])
+    sample_indices = np.sort(rng.choice(X.shape[0], n_display, replace=False))
+
+    pdp_records = []
+    ice_records = []
+    fig, axes = plt.subplots(2, 4, figsize=(12.8, 6.6))
     axes = axes.flatten()
-    
-    for feat_idx in range(N_CONTINUOUS):
-        ax = axes[feat_idx]
-        feat_name = CONTINUOUS_COLS[feat_idx]
-        
-        # Use scaled values for model prediction
-        x_scaled = np.linspace(X[:, feat_idx].min(), X[:, feat_idx].max(), 50)
-        # Convert to original scale for plotting
-        x_orig = inverse_transform_feature(scaler, feat_idx, x_scaled)
-        
-        ice_curves = []
-        for sample_idx in sample_indices:
-            y_vals = []
-            for xv in x_scaled:
-                X_temp = X[sample_idx:sample_idx+1].copy()
-                X_temp[0, feat_idx] = xv
-                y_vals.append(model.predict(X_temp)[0])
-            ice_curves.append(y_vals)
-            ax.plot(x_orig, y_vals, color=COLORS[1], alpha=0.1, lw=0.5)
-        
-        pdp = np.mean(ice_curves, axis=0)
-        ax.plot(x_orig, pdp, color=COLORS[0], lw=2, label='PDP')
-        
-        setup_publication_axes(ax, xlabel=FEATURE_UNITS.get(feat_name, feat_name),
-                              ylabel=f'Predicted {target}', title=f'({chr(97+feat_idx)}) {feat_name}')
-        if feat_idx == 0:
-            ax.legend(loc='best', fontsize=8)
-        all_data.append({"Feature": feat_name, "X_values": x_orig.tolist(), "PDP": pdp.tolist()})
-    
-    fig.suptitle(f'{model.name} ICE/PDP - {TARGET_UNITS.get(target, target)}', fontsize=12, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_ice_pdp.png"), dpi=300, bbox_inches='tight', facecolor='white')
-    plt.savefig(os.path.join(save_dir, f"{model.name}_{target}_ice_pdp.pdf"), bbox_inches='tight', facecolor='white')
-    plt.close()
-    df = pd.DataFrame(all_data)
-    df.to_excel(os.path.join(save_dir, f"{model.name}_{target}_ice_pdp.xlsx"), index=False)
-    return df
+
+    for feature_idx in range(N_CONTINUOUS):
+        ax = axes[feature_idx]
+        feature_name = CONTINUOUS_COLS[feature_idx]
+        x_scaled = _make_feature_grid(X, feature_idx, n_grid)
+        x_original = inverse_transform_feature(scaler, feature_idx, x_scaled)
+
+        X_all = np.repeat(X[np.newaxis, :, :], n_grid, axis=0)
+        X_all[:, :, feature_idx] = x_scaled[:, np.newaxis]
+        all_predictions = model.predict(X_all.reshape(-1, X.shape[1])).reshape(n_grid, X.shape[0])
+        pdp = np.mean(all_predictions, axis=1)
+
+        X_display = X[sample_indices]
+        X_ice = np.repeat(X_display[np.newaxis, :, :], n_grid, axis=0)
+        X_ice[:, :, feature_idx] = x_scaled[:, np.newaxis]
+        ice_matrix = model.predict(X_ice.reshape(-1, X.shape[1])).reshape(n_grid, n_display).T
+
+        for line_idx, curve in enumerate(ice_matrix):
+            ax.plot(x_original, curve, color=COLORS[1], alpha=0.12, linewidth=0.55)
+            for xv, yv in zip(x_original, curve):
+                ice_records.append({"Target": target, "Feature": feature_name, "SampleIndex": int(sample_indices[line_idx]), "X": float(xv), "ICE": float(yv)})
+
+        ax.plot(x_original, pdp, color=COLORS[0], linewidth=2.2, label="PDP (all observations)")
+        ax.set_xlabel(FEATURE_UNITS.get(feature_name, feature_name))
+        ax.set_ylabel(f"Predicted {TARGET_UNITS.get(target, target)}", fontsize=9)
+        ax.set_title(f"({chr(97 + feature_idx)}) {feature_name.replace('Steam/Biomass', 'S/B')}", loc="left", fontsize=10.5, fontweight="bold")
+        ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.28)
+        ax.tick_params(which="both", direction="in", top=True, right=True)
+        _add_observation_rug(ax, inverse_transform_feature(scaler, feature_idx, X[:, feature_idx]))
+        if feature_idx == 0:
+            ax.legend(loc="best", fontsize=8, frameon=False)
+
+        for xv, yv in zip(x_original, pdp):
+            pdp_records.append({"Target": target, "Feature": feature_name, "X": float(xv), "PDP": float(yv)})
+
+    fig.suptitle(f"{model.name} ICE/PDP analysis: {target}", fontsize=12, fontweight="bold", y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
+    stem = os.path.join(save_dir, f"{model.name}_{target}_ice_pdp")
+    fig.savefig(stem + ".png", dpi=600, bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".pdf", bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".svg", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    pdp_df = pd.DataFrame(pdp_records)
+    ice_df = pd.DataFrame(ice_records)
+    with pd.ExcelWriter(stem + ".xlsx") as writer:
+        pdp_df.to_excel(writer, sheet_name="PDP_all_observations", index=False)
+        ice_df.to_excel(writer, sheet_name="ICE_50_samples", index=False)
+    return {"pdp": pdp_df, "ice": ice_df}
+
+def _compute_pairwise_interaction_surface(model: GAMModelWrapper, X: np.ndarray,
+                                          scaler: StandardScaler, term_idx: int,
+                                          feature_i: int, feature_j: int,
+                                          grid_size: int = 50) -> Dict[str, Any]:
+    """Evaluate one retained GA2M pairwise term on a continuous/binary grid."""
+    ebm = _unwrap_ebm(model)
+    observed_terms = _eval_ebm_terms(ebm, X)
+    observed_mean = float(np.mean(observed_terms[:, term_idx]))
+
+    def build_grid(feature_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        if feature_idx < N_CONTINUOUS:
+            scaled = _make_feature_grid(X, feature_idx, grid_size)
+            original = inverse_transform_feature(scaler, feature_idx, scaled)
+        else:
+            # Bed material is represented by binary one-hot indicators.
+            scaled = np.asarray([0.0, 1.0], dtype=float)
+            original = scaled.copy()
+        return scaled, original
+
+    x_scaled, x_original = build_grid(feature_i)
+    y_scaled, y_original = build_grid(feature_j)
+    n_x, n_y = len(x_scaled), len(y_scaled)
+    Z = np.empty((n_y, n_x), dtype=float)
+
+    for row_idx, y_value in enumerate(y_scaled):
+        X_row = np.repeat(X[np.newaxis, :, :], n_x, axis=0)
+        X_row[:, :, feature_i] = x_scaled[:, np.newaxis]
+        X_row[:, :, feature_j] = y_value
+        term_values = _eval_ebm_terms(
+            ebm, X_row.reshape(-1, X.shape[1])
+        )[:, term_idx]
+        Z[row_idx, :] = (
+            term_values.reshape(n_x, X.shape[0]).mean(axis=1) - observed_mean
+        )
+
+    X_mesh, Y_mesh = np.meshgrid(x_original, y_original)
+
+    def observed_values(feature_idx: int) -> np.ndarray:
+        if feature_idx < N_CONTINUOUS:
+            return inverse_transform_feature(
+                scaler, feature_idx, X[:, feature_idx]
+            )
+        return np.asarray(X[:, feature_idx], dtype=float)
+
+    return {
+        "term_idx": int(term_idx),
+        "feature_i": int(feature_i),
+        "feature_j": int(feature_j),
+        "feature_i_name": FEATURE_COLUMNS[feature_i],
+        "feature_j_name": FEATURE_COLUMNS[feature_j],
+        "feature_i_is_categorical": bool(feature_i >= N_CONTINUOUS),
+        "feature_j_is_categorical": bool(feature_j >= N_CONTINUOUS),
+        "x_scaled": x_scaled,
+        "y_scaled": y_scaled,
+        "x_original": x_original,
+        "y_original": y_original,
+        "X_mesh": X_mesh,
+        "Y_mesh": Y_mesh,
+        "Z": Z,
+        "observed_x": observed_values(feature_i),
+        "observed_y": observed_values(feature_j),
+    }
+
+def _draw_interaction_panel(ax, record: Dict[str, Any], target: str,
+                            vlim: float, panel_label: str = None,
+                            show_title: bool = True):
+    """Draw one isolated pairwise interaction panel and return the mappable."""
+    vlim = max(float(vlim), 1e-12)
+    levels = np.linspace(-vlim, vlim, 21)
+    norm = TwoSlopeNorm(vmin=-vlim, vcenter=0.0, vmax=vlim)
+    contour = ax.contourf(
+        record["X_mesh"], record["Y_mesh"], record["Z"],
+        levels=levels, cmap="RdBu_r", norm=norm, extend="both",
+    )
+    zero_min, zero_max = float(np.nanmin(record["Z"])), float(np.nanmax(record["Z"]))
+    if zero_min <= 0 <= zero_max:
+        ax.contour(record["X_mesh"], record["Y_mesh"], record["Z"],
+                   levels=[0], colors="black", linewidths=0.85, linestyles="-")
+
+    ax.scatter(record["observed_x"], record["observed_y"], s=7,
+               facecolors="none", edgecolors="black", linewidths=0.35,
+               alpha=0.22, rasterized=True)
+    ax.set_xlabel(FEATURE_UNITS.get(record["feature_i_name"], record["feature_i_name"]))
+    ax.set_ylabel(FEATURE_UNITS.get(record["feature_j_name"], record["feature_j_name"]))
+    if show_title:
+        pair_name = (
+            f"{record['feature_i_name'].replace('Steam/Biomass', 'S/B')} x "
+            f"{record['feature_j_name'].replace('Steam/Biomass', 'S/B')}"
+        )
+        prefix = f"{panel_label} " if panel_label else ""
+        ax.set_title(f"{prefix}{pair_name}", loc="left", fontsize=10.2, fontweight="bold")
+    ax.tick_params(which="both", direction="in", top=True, right=True)
+    ax.grid(False)
+    return contour
 
 
-def plot_bivariate_3d(model: GAMModelWrapper, X: np.ndarray, scaler: StandardScaler,
-                     target: str, save_dir: str, top_pairs: int = 4) -> None:
+def plot_pairwise_interaction_surfaces(model: GAMModelWrapper, X: np.ndarray,
+                                       scaler: StandardScaler, target: str,
+                                       save_dir: str, top_n: int = 3,
+                                       grid_size: int = 50) -> List[Dict[str, Any]]:
     """
-    Plot 3D surface plots for bivariate dependencies.
-    Generates C(8,2)=28 independent plots for all pairs of 8 continuous features.
-    Each plot is saved as a separate file to ensure complete display without clipping.
-    
-    Reference: Lou et al. (2013) GA2M pairwise interaction visualization.
+    Rank and visualize isolated continuous-variable pairwise terms of GA2M-Mono.
+
+    The surfaces exclude the corresponding main effects and show deviations from
+    additive expectation. Only interactions between the eight continuous inputs
+    are considered for the manuscript analysis; bed-material interactions remain
+    available in the complete term-importance table.
     """
-    from itertools import combinations
-    
-    # Create dedicated subdirectory for bivariate plots
-    bivariate_dir = os.path.join(save_dir, "bivariate_3d")
-    ensure_dir(bivariate_dir)
-    
-    # Use ALL 8 continuous features for bivariate analysis
-    # C(8,2) = 28 pairs
-    all_feature_indices = list(range(N_CONTINUOUS))  # 0-7 for all 8 continuous features
-    pairs = list(combinations(all_feature_indices, 2))
-    n_pairs = len(pairs)
-    
-    print(f"      Generating {n_pairs} bivariate 3D plots (8 features, C(8,2)=28 pairs)...")
-    
-    # Compute base prediction input (median of all features)
-    X_base = np.median(X, axis=0)
-    
-    for pair_idx, (i, j) in enumerate(pairs, 1):
-        feat_i, feat_j = CONTINUOUS_COLS[i], CONTINUOUS_COLS[j]
-        
-        print(f"        [{pair_idx}/{n_pairs}] {feat_i} vs {feat_j}")
-        
-        # Create grid in scaled space
-        x_i_scaled = np.linspace(X[:, i].min(), X[:, i].max(), 30)
-        x_j_scaled = np.linspace(X[:, j].min(), X[:, j].max(), 30)
-        Xi_scaled, Xj_scaled = np.meshgrid(x_i_scaled, x_j_scaled)
-        
-        # Convert to original scale for plotting
-        Xi_orig = inverse_transform_feature(scaler, i, Xi_scaled)
-        Xj_orig = inverse_transform_feature(scaler, j, Xj_scaled)
-        
-        # Compute predictions for the grid
-        Z = np.zeros_like(Xi_scaled)
-        for ii in range(Xi_scaled.shape[0]):
-            for jj in range(Xi_scaled.shape[1]):
-                X_temp = X_base.copy().reshape(1, -1)
-                X_temp[0, i] = Xi_scaled[ii, jj]
-                X_temp[0, j] = Xj_scaled[ii, jj]
-                Z[ii, jj] = model.predict(X_temp)[0]
-        
-        # Create independent figure for each pair (larger size for complete display)
-        fig = plt.figure(figsize=(9, 7))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        # Plot surface
-        surf = ax.plot_surface(Xi_orig, Xj_orig, Z, cmap='viridis', alpha=0.9,
-                              linewidth=0, antialiased=True, edgecolor='none')
-        
-        # Set axis labels with units
-        ax.set_xlabel(FEATURE_UNITS.get(feat_i, feat_i), fontsize=11, fontweight='bold', labelpad=10)
-        ax.set_ylabel(FEATURE_UNITS.get(feat_j, feat_j), fontsize=11, fontweight='bold', labelpad=10)
-        ax.set_zlabel(TARGET_UNITS.get(target, target), fontsize=11, fontweight='bold', labelpad=8)
-        
-        # Set title
-        ax.set_title(f'Bivariate Dependency: {feat_i} vs {feat_j} → {target}', 
-                    fontsize=12, fontweight='bold', pad=15)
-        
-        ax.tick_params(axis='both', which='major', labelsize=9, pad=3)
-        ax.view_init(elev=25, azim=45)
-        
-        # Add colorbar
-        cbar = fig.colorbar(surf, ax=ax, shrink=0.6, aspect=15, pad=0.12)
-        cbar.set_label(TARGET_UNITS.get(target, target), fontsize=10, fontweight='bold')
+    ensure_dir(save_dir)
+    interaction_dir = os.path.join(save_dir, "pairwise_interaction_contributions")
+    ensure_dir(interaction_dir)
+
+    importance_df = _get_term_importance_table(model, X)
+    all_continuous_pairs = importance_df[
+        importance_df["FeatureIndices"].apply(
+            lambda term: isinstance(term, tuple) and len(term) == 2 and all(idx < N_CONTINUOUS for idx in term)
+        )
+    ].copy().reset_index(drop=True)
+    continuous_pairs = all_continuous_pairs.head(top_n).copy().reset_index(drop=True)
+    if continuous_pairs.empty:
+        print(f"      No continuous-variable pairwise terms were found for {target}.")
+        return []
+
+    records = []
+    print(f"      Extracting the top {len(continuous_pairs)} isolated pairwise terms for {target}...")
+    for rank, row in continuous_pairs.iterrows():
+        feature_i, feature_j = tuple(row["FeatureIndices"])
+        print(f"        [{rank + 1}/{len(continuous_pairs)}] {str(row['Term']).replace(' x ', ' x ')}")
+        record = _compute_pairwise_interaction_surface(
+            model=model,
+            X=X,
+            scaler=scaler,
+            term_idx=int(row["TermIndex"]),
+            feature_i=int(feature_i),
+            feature_j=int(feature_j),
+            grid_size=grid_size,
+        )
+        record["rank"] = int(rank + 1)
+        record["importance"] = float(row["Importance"])
+        record["target"] = target
+        records.append(record)
+
+    target_vlim = max(float(np.nanmax(np.abs(record["Z"]))) for record in records)
+
+    # One publication-ready panel per interaction.
+    for record in records:
+        fig, ax = plt.subplots(figsize=(5.5, 4.5))
+        contour = _draw_interaction_panel(
+            ax, record, target, target_vlim,
+            panel_label=f"Rank {record['rank']}:", show_title=True,
+        )
+        cbar = fig.colorbar(contour, ax=ax, pad=0.025, fraction=0.05)
+        cbar.set_label(_target_contribution_label(target, "Pairwise contribution"), fontsize=9.5)
         cbar.ax.tick_params(labelsize=8)
-        
-        # Save as independent file
-        fig.tight_layout(rect=[0, 0, 0.95, 1])
-        filename_base = f"bivariate_{feat_i}_{feat_j}".replace("/", "_")
-        plt.savefig(os.path.join(bivariate_dir, f"{filename_base}.png"), 
-                   dpi=200, bbox_inches='tight', facecolor='white')
+        ax.text(0.015, 0.015, f"Mean |term contribution| = {record['importance']:.3f}",
+                transform=ax.transAxes, fontsize=8, ha="left", va="bottom",
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.78, pad=2.0))
+        fig.tight_layout()
+        pair_stub = (
+            f"{record['feature_i_name']}_{record['feature_j_name']}"
+            .replace("/", "_").replace(" ", "_")
+        )
+        stem = os.path.join(interaction_dir, f"rank_{record['rank']}_{target}_{pair_stub}")
+        fig.savefig(stem + ".png", dpi=600, bbox_inches="tight", facecolor="white")
+        fig.savefig(stem + ".pdf", bbox_inches="tight", facecolor="white")
+        fig.savefig(stem + ".svg", bbox_inches="tight", facecolor="white")
         plt.close(fig)
-    
-    print(f"      Saved {n_pairs} bivariate 3D plots to {bivariate_dir}")
+
+        export_rows = []
+        for row_idx, y_value in enumerate(record["y_original"]):
+            for col_idx, x_value in enumerate(record["x_original"]):
+                export_rows.append({
+                    "Target": target,
+                    "Rank": record["rank"],
+                    "Term": _format_term_name((record["feature_i"], record["feature_j"])),
+                    "X": float(x_value),
+                    "Y": float(y_value),
+                    "PairwiseContribution": float(record["Z"][row_idx, col_idx]),
+                })
+        pd.DataFrame(export_rows).to_excel(stem + ".xlsx", index=False)
+
+    # Three-panel target-specific figure for the Supplementary Information.
+    fig, axes = plt.subplots(1, len(records), figsize=(5.0 * len(records), 4.25), squeeze=False)
+    axes = axes.flatten()
+    contour = None
+    for idx, record in enumerate(records):
+        contour = _draw_interaction_panel(
+            axes[idx], record, target, target_vlim,
+            panel_label=f"({chr(97 + idx)})", show_title=True,
+        )
+    if contour is not None:
+        cbar = fig.colorbar(contour, ax=axes.tolist(), pad=0.018, fraction=0.025)
+        cbar.set_label(_target_contribution_label(target, "Pairwise contribution"), fontsize=9.5)
+        cbar.ax.tick_params(labelsize=8)
+    fig.suptitle(f"Leading GA2M-Mono pairwise contributions: {target}",
+                 fontsize=11.5, fontweight="bold", y=1.01)
+    fig.subplots_adjust(left=0.06, right=0.91, bottom=0.14, top=0.88, wspace=0.28)
+    stem = os.path.join(interaction_dir, f"{target}_top_{len(records)}_pairwise_interactions")
+    fig.savefig(stem + ".png", dpi=600, bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".pdf", bbox_inches="tight", facecolor="white")
+    fig.savefig(stem + ".svg", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    ranking_export = all_continuous_pairs.copy()
+    ranking_export["FeatureIndices"] = ranking_export["FeatureIndices"].apply(
+        lambda value: ",".join(map(str, value))
+    )
+    ranking_export.to_excel(
+        os.path.join(interaction_dir, f"{target}_continuous_pairwise_ranking.xlsx"), index=False
+    )
+    return records
 
 
-def generate_best_model_analysis(df_results: pd.DataFrame, df: pd.DataFrame, 
+def plot_interaction_summary(interaction_records: Dict[str, List[Dict[str, Any]]],
+                             save_dir: str) -> None:
+    """Create both the four-panel main figure and the complete 4 x 3 interaction figure."""
+    targets = [t for t in ["H2", "CO", "CO2", "CH4"] if interaction_records.get(t)]
+    if not targets:
+        return
+    ensure_dir(save_dir)
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.6, 8.6), constrained_layout=True)
+    axes = axes.flatten()
+    for panel_idx, target in enumerate(targets):
+        record = interaction_records[target][0]
+        vlim = float(np.nanmax(np.abs(record["Z"])))
+        contour = _draw_interaction_panel(axes[panel_idx], record, target, vlim,
+                                          panel_label=f"({chr(97 + panel_idx)}) {target}", show_title=True)
+        cbar = fig.colorbar(contour, ax=axes[panel_idx], pad=0.02, fraction=0.046)
+        cbar.set_label(_target_contribution_label(target, "Pairwise contribution"), fontsize=8.2)
+        cbar.ax.tick_params(labelsize=7.2)
+    for idx in range(len(targets), len(axes)):
+        axes[idx].axis("off")
+    stem = os.path.join(save_dir, "Fig4_main_leading_pairwise_interactions")
+    fig.savefig(stem + ".png", dpi=600, facecolor="white")
+    fig.savefig(stem + ".pdf", facecolor="white")
+    fig.savefig(stem + ".svg", facecolor="white")
+    plt.close(fig)
+
+    max_cols = max(len(interaction_records[target]) for target in targets)
+    fig = plt.figure(figsize=(5.15 * max_cols + 1.1, 3.95 * len(targets)), constrained_layout=True)
+    gs = fig.add_gridspec(len(targets), max_cols + 1, width_ratios=[1] * max_cols + [0.06])
+    for row_idx, target in enumerate(targets):
+        target_records = interaction_records[target]
+        target_vlim = max(float(np.nanmax(np.abs(record["Z"]))) for record in target_records)
+        row_contour = None
+        for col_idx in range(max_cols):
+            ax = fig.add_subplot(gs[row_idx, col_idx])
+            if col_idx >= len(target_records):
+                ax.axis("off")
+                continue
+            record = target_records[col_idx]
+            panel_number = row_idx * max_cols + col_idx
+            row_contour = _draw_interaction_panel(ax, record, target, target_vlim,
+                                                  panel_label=f"({chr(97 + panel_number)})", show_title=True)
+            if col_idx == 0:
+                ax.text(-0.30, 0.5, target, transform=ax.transAxes, rotation=90,
+                        va="center", ha="center", fontsize=11.5, fontweight="bold")
+        cax = fig.add_subplot(gs[row_idx, max_cols])
+        if row_contour is not None:
+            cbar = fig.colorbar(row_contour, cax=cax)
+            cbar.set_label(_target_contribution_label(target, "Pairwise contribution"), fontsize=8.4)
+            cbar.ax.tick_params(labelsize=7.2)
+        else:
+            cax.axis("off")
+    stem = os.path.join(save_dir, "FigS_pairwise_interactions_top3_four_targets")
+    fig.savefig(stem + ".png", dpi=600, facecolor="white")
+    fig.savefig(stem + ".pdf", facecolor="white")
+    fig.savefig(stem + ".svg", facecolor="white")
+    plt.close(fig)
+
+def generate_best_model_analysis(df_results: pd.DataFrame, df: pd.DataFrame,
                                  models: List[GAMModelWrapper], save_dir: str) -> None:
-    """Generate advanced analysis for best model including 3D bivariate plots."""
-    print("\n[7] Generating advanced visualizations for best model...")
-    
-    for target in TARGETS:
+    """
+    Refit the selected model for interpretation and regenerate publication figures.
+
+    Cross-validation, model selection, prediction metrics, fold assignments, and
+    random seeds are unchanged. This function modifies only the interpretation
+    outputs generated after those numerical results have already been obtained.
+    """
+    print("\n[7] Generating publication-quality interpretability visualizations...")
+    interpretation_targets = ["H2", "CO", "CO2", "CH4"]
+    feature_tables: Dict[str, pd.DataFrame] = {}
+    shape_tables: Dict[str, pd.DataFrame] = {}
+    ice_tables: Dict[str, Dict[str, pd.DataFrame]] = {}
+    interaction_records: Dict[str, List[Dict[str, Any]]] = {}
+
+    summary_dir = os.path.join(save_dir, "interpretability_summary")
+    ensure_dir(summary_dir)
+
+    for target in interpretation_targets:
         print(f"\n  Target: {target}")
         df_target = df_results[df_results["Target"] == target]
         df_agg = df_target.groupby("Model").agg({"PhysRate": "mean", "R2": "mean"}).reset_index()
         df_perfect = df_agg[df_agg["PhysRate"] >= 99.9]
         if df_perfect.empty:
             df_perfect = df_agg.nlargest(3, "PhysRate")
-            print(f"    No model with 100% PhysRate, using top 3")
+            print("    No model with 100% PhysRate; using the three highest-PhysRate models")
         df_best = df_perfect.nlargest(1, "R2")
         best_model_name = df_best["Model"].iloc[0]
         best_r2 = df_best["R2"].iloc[0]
         best_phys = df_best["PhysRate"].iloc[0]
-        print(f"    Best model: {best_model_name} ($R^2$={best_r2:.4f}, PhysRate={best_phys:.1f}%)")
-        
+        print(f"    Best model: {best_model_name} (R2={best_r2:.4f}, PhysRate={best_phys:.1f}%)")
+
         best_model = None
-        for m in models:
-            if m.name == best_model_name:
-                best_model = m.clone()
+        for candidate in models:
+            if candidate.name == best_model_name:
+                best_model = candidate.clone()
                 break
         if best_model is None:
             print(f"    ERROR: Model {best_model_name} not found")
             continue
-        
+
         df_target_data = split_target(df, target)
         scaler = fit_scaler(df_target_data)
         X = transform_features(df_target_data, scaler)
         y = df_target_data[target].values
         best_model.fit(X, y, target=target)
-        
+
         best_dir = os.path.join(save_dir, target, "best_model_analysis")
         ensure_dir(best_dir)
-        
-        print(f"    Generating shape functions...")
-        plot_shape_functions(best_model, X, scaler, target, best_dir)
-        
-        print(f"    Generating ICE/PDP plots...")
-        plot_ice_pdp(best_model, X, scaler, target, best_dir)
-        
-        print(f"    Generating 3D bivariate dependency plots...")
-        plot_bivariate_3d(best_model, X, scaler, target, best_dir)
-        
+
+        print("    Generating term-importance figure...")
+        feature_tables[target] = plot_feature_importance(best_model, best_dir, target, X=X, top_n=15)
+
+        print("    Generating main-effect functions...")
+        shape_tables[target] = plot_shape_functions(best_model, X, scaler, target, best_dir)
+
+        print("    Generating ICE/PDP figures...")
+        ice_tables[target] = plot_ice_pdp(best_model, X, scaler, target, best_dir)
+
+        print("    Generating isolated pairwise-interaction surfaces...")
+        interaction_records[target] = plot_pairwise_interaction_surfaces(best_model, X, scaler, target, best_dir, top_n=2, grid_size=50)
+
         pd.DataFrame([{"Target": target, "Best_Model": best_model_name, "R2": best_r2, "PhysRate": best_phys}]).to_excel(
-            os.path.join(best_dir, "best_model_info.xlsx"), index=False)
+            os.path.join(best_dir, "best_model_info.xlsx"), index=False
+        )
         print(f"    Saved to: {best_dir}")
 
+    print("\n  Generating cross-target manuscript figures...")
+    plot_feature_importance_summary(feature_tables, summary_dir, top_n=12)
+    plot_interaction_summary(interaction_records, summary_dir)
+    export_manuscript_figures(save_dir, feature_tables, shape_tables, ice_tables, interaction_records)
+    print(f"  Interpretability summary saved to: {summary_dir}")
+
+def _copy_if_exists(src_stem: str, dst_stem: str, exts=(".png", ".pdf", ".svg", ".xlsx")) -> None:
+    for ext in exts:
+        src = src_stem + ext
+        dst = dst_stem + ext
+        if os.path.exists(src):
+            ensure_dir(os.path.dirname(dst))
+            shutil.copy2(src, dst)
+
+
+def _panel_sequence(n: int) -> List[str]:
+    return [f"({chr(97 + i)})" for i in range(n)]
+
+
+def _plot_shape_or_ice_summary(data_dict: Dict[str, Any], figure_path_stem: str,
+                               excel_path: str, features: List[str],
+                               targets: List[str], kind: str = "shape") -> None:
+    n_rows = len(targets)
+    n_cols = len(features)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.8 * n_cols, 2.35 * n_rows), constrained_layout=True)
+    if n_rows == 1:
+        axes = np.array([axes])
+    labels = _panel_sequence(n_rows * n_cols)
+    panel_idx = 0
+    for row_idx, target in enumerate(targets):
+        for col_idx, feature in enumerate(features):
+            ax = axes[row_idx, col_idx]
+            if kind == "shape":
+                df_plot = data_dict[target]
+                sub = df_plot[df_plot["Feature"] == feature].copy()
+                ax.plot(sub["X"], sub["MainEffectContribution"], color=COLORS[0], linewidth=1.7)
+                ax.fill_between(sub["X"], 0, sub["MainEffectContribution"], color=COLORS[0], alpha=0.14, linewidth=0)
+                ax.axhline(0, color="black", linestyle="--", linewidth=0.75, alpha=0.7)
+                ylabel = _target_contribution_label(target, "Main-effect contribution")
+            else:
+                item = data_dict[target]
+                pdp_df = item["pdp"]
+                ice_df = item["ice"]
+                sub_pdp = pdp_df[pdp_df["Feature"] == feature].copy()
+                sub_ice = ice_df[ice_df["Feature"] == feature].copy()
+                for _, curve_df in sub_ice.groupby("SampleIndex"):
+                    ax.plot(curve_df["X"], curve_df["ICE"], color=COLORS[1], alpha=0.10, linewidth=0.45)
+                ax.plot(sub_pdp["X"], sub_pdp["PDP"], color=COLORS[0], linewidth=1.8)
+                ylabel = f"Predicted {TARGET_UNITS.get(target, target)}"
+            ax.set_xlabel(FEATURE_UNITS.get(feature, feature), fontsize=8.6)
+            ax.set_ylabel(ylabel, fontsize=8.2)
+            ax.set_title(f"{labels[panel_idx]} {target}: {feature.replace('Steam/Biomass', 'S/B')}", loc="left", fontsize=9.1, fontweight="bold")
+            ax.tick_params(which="both", direction="in", top=True, right=True, labelsize=7.6)
+            ax.grid(True, linestyle="--", linewidth=0.38, alpha=0.23)
+            panel_idx += 1
+    fig.savefig(figure_path_stem + ".png", dpi=600, facecolor="white")
+    fig.savefig(figure_path_stem + ".pdf", facecolor="white")
+    fig.savefig(figure_path_stem + ".svg", facecolor="white")
+    plt.close(fig)
+    with pd.ExcelWriter(excel_path) as writer:
+        for target in targets:
+            if kind == "shape":
+                data_dict[target].to_excel(writer, sheet_name=target, index=False)
+            else:
+                data_dict[target]["pdp"].to_excel(writer, sheet_name=f"{target}_PDP", index=False)
+                data_dict[target]["ice"].to_excel(writer, sheet_name=f"{target}_ICE", index=False)
+
+
+def _plot_best_split_mono_summary(results_root: str, figure_path_stem: str, excel_path: str) -> None:
+    mono_models = ["pyGAM_Mono", "EBM_Mono", "GA2M_Mono", "NAM_Mono"]
+    targets = ["H2", "CO", "CO2", "CH4"]
+    fig, axes = plt.subplots(len(targets), len(mono_models), figsize=(13.6, 12.6), constrained_layout=True)
+    export_sheets = {}
+    for i, target in enumerate(targets):
+        for j, model_name in enumerate(mono_models):
+            ax = axes[i, j]
+            xlsx_path = os.path.join(results_root, target, f"{model_name}_{target}_predictions.xlsx")
+            if not os.path.exists(xlsx_path):
+                ax.axis("off")
+                continue
+            pred_df = pd.read_excel(xlsx_path)
+            export_sheets[f"{target}_{model_name}"] = pred_df
+            df_train = pred_df[pred_df["Set"] == "Train"]
+            df_test = pred_df[pred_df["Set"] == "Test"]
+            ax.scatter(df_train["Actual"], df_train["Predicted"], c=COLORS[1], alpha=0.35, s=14, edgecolors='none')
+            ax.scatter(df_test["Actual"], df_test["Predicted"], c=COLORS[0], alpha=0.72, s=18, edgecolors='white', linewidth=0.25)
+            all_vals = np.concatenate([pred_df["Actual"].values, pred_df["Predicted"].values])
+            vmin, vmax = np.nanmin(all_vals), np.nanmax(all_vals)
+            margin = 0.05 * (vmax - vmin if vmax > vmin else 1.0)
+            lims = [vmin - margin, vmax + margin]
+            ax.plot(lims, lims, color='black', linewidth=0.8)
+            ax.set_xlim(lims); ax.set_ylim(lims)
+            ax.set_aspect('equal', adjustable='box')
+            ax.set_title(f"{_panel_sequence(len(targets)*len(mono_models))[i*len(mono_models)+j]} {model_name}", loc='left', fontsize=9.0, fontweight='bold')
+            if j == 0:
+                ax.set_ylabel(f"Predicted {TARGET_UNITS.get(target, target)}", fontsize=8.2)
+            else:
+                ax.set_ylabel("")
+            if i == len(targets) - 1:
+                ax.set_xlabel(f"Measured {TARGET_UNITS.get(target, target)}", fontsize=8.2)
+            else:
+                ax.set_xlabel("")
+            r2_test = r2_score(df_test["Actual"], df_test["Predicted"]) if len(df_test) > 1 else np.nan
+            ax.text(0.04, 0.95, f"{target}\nTest $R^2$={r2_test:.3f}", transform=ax.transAxes, va='top', ha='left', fontsize=7.2, bbox=dict(facecolor='white', edgecolor='none', alpha=0.80, pad=1.8))
+            ax.tick_params(which='both', direction='in', top=True, right=True, labelsize=7.0)
+            ax.grid(True, linestyle='--', linewidth=0.35, alpha=0.2)
+    fig.savefig(figure_path_stem + ".png", dpi=600, facecolor="white")
+    fig.savefig(figure_path_stem + ".pdf", facecolor="white")
+    fig.savefig(figure_path_stem + ".svg", facecolor="white")
+    plt.close(fig)
+    with pd.ExcelWriter(excel_path) as writer:
+        for sheet, df_sheet in export_sheets.items():
+            df_sheet.to_excel(writer, sheet_name=sheet[:31], index=False)
+
+
+def _export_interaction_excel(interaction_records: Dict[str, List[Dict[str, Any]]], excel_path: str) -> None:
+    with pd.ExcelWriter(excel_path) as writer:
+        for target, records in interaction_records.items():
+            rows = []
+            for record in records:
+                for row_idx, y_value in enumerate(record["y_original"]):
+                    for col_idx, x_value in enumerate(record["x_original"]):
+                        rows.append({"Target": target, "Rank": record["rank"], "Term": _format_term_name((record["feature_i"], record["feature_j"])), "FeatureX": record["feature_i_name"], "FeatureY": record["feature_j_name"], "X": float(x_value), "Y": float(y_value), "PairwiseContribution": float(record["Z"][row_idx, col_idx])})
+            pd.DataFrame(rows).to_excel(writer, sheet_name=target, index=False)
+
+
+def export_manuscript_figures(results_root: str,
+                              feature_tables: Dict[str, pd.DataFrame],
+                              shape_tables: Dict[str, pd.DataFrame],
+                              ice_tables: Dict[str, Dict[str, pd.DataFrame]],
+                              interaction_records: Dict[str, List[Dict[str, Any]]]) -> None:
+    figures_dir = os.path.join(results_root, "manuscript_figures")
+    excels_dir = os.path.join(results_root, "manuscript_excels")
+    ensure_dir(figures_dir)
+    ensure_dir(excels_dir)
+
+    _copy_if_exists(os.path.join(results_root, "interpretability_summary", "Fig_feature_importance_GA2M_Mono_four_targets"), os.path.join(figures_dir, "Fig1_feature_importance_GA2M_Mono_four_targets"), exts=(".png", ".pdf", ".svg"))
+    with pd.ExcelWriter(os.path.join(excels_dir, "Fig1_feature_importance_GA2M_Mono_four_targets.xlsx")) as writer:
+        for target, df_table in feature_tables.items():
+            df_table.to_excel(writer, sheet_name=target, index=False)
+
+    targets = ["H2", "CO", "CO2", "CH4"]
+    biomass_features = ["C", "H", "O", "Ash", "Moisture"]
+    operating_features = ["T", "ER", "Steam/Biomass"]
+
+    _plot_shape_or_ice_summary(shape_tables, os.path.join(figures_dir, "Fig2_shape_functions_biomass"), os.path.join(excels_dir, "Fig2_shape_functions_biomass.xlsx"), biomass_features, targets, kind="shape")
+    _plot_shape_or_ice_summary(shape_tables, os.path.join(figures_dir, "Fig3_shape_functions_operating"), os.path.join(excels_dir, "Fig3_shape_functions_operating.xlsx"), operating_features, targets, kind="shape")
+
+    _copy_if_exists(os.path.join(results_root, "interpretability_summary", "Fig4_main_leading_pairwise_interactions"), os.path.join(figures_dir, "Fig4_representative_bivariate_response_surfaces"), exts=(".png", ".pdf", ".svg"))
+    _export_interaction_excel(interaction_records, os.path.join(excels_dir, "Fig4_representative_bivariate_response_surfaces.xlsx"))
+
+    _plot_best_split_mono_summary(results_root, os.path.join(figures_dir, "FigS1_predicted_vs_measured_best_split_GAMs_Mono"), os.path.join(excels_dir, "FigS1_predicted_vs_measured_best_split_GAMs_Mono.xlsx"))
+    _plot_shape_or_ice_summary(ice_tables, os.path.join(figures_dir, "FigS2_ICE_PDP_biomass"), os.path.join(excels_dir, "FigS2_ICE_PDP_biomass.xlsx"), biomass_features, targets, kind="ice")
+    _plot_shape_or_ice_summary(ice_tables, os.path.join(figures_dir, "FigS3_ICE_PDP_operating"), os.path.join(excels_dir, "FigS3_ICE_PDP_operating.xlsx"), operating_features, targets, kind="ice")
+    _copy_if_exists(os.path.join(results_root, "interpretability_summary", "FigS_pairwise_interactions_top3_four_targets"), os.path.join(figures_dir, "FigS_pairwise_interactions_top3_four_targets"), exts=(".png", ".pdf", ".svg"))
 
 def save_model_and_scaler(model: GAMModelWrapper, scaler: StandardScaler, target: str, save_dir: str) -> Tuple[str, str]:
     model_dir = os.path.join(save_dir, "saved_models")
@@ -1398,6 +1968,1293 @@ def generate_comprehensive_fold_summary(df_all: pd.DataFrame, save_dir: str) -> 
         df_agg_full.to_excel(writer, sheet_name="Aggregated_Stats", index=False)
     
     print(f"    Comprehensive fold summary saved to: {summary_path}")
+
+
+# The earlier full-pipeline entry point is intentionally disabled.
+# Execution is controlled only by the final figure-only main() below.
+
+# =============================================================================
+# FINAL MANUSCRIPT-FIGURE PIPELINE
+# =============================================================================
+# Full-pipeline version: run cross-validation, model evaluation, best-fold
+# prediction plots, final model fitting, and manuscript figure generation.
+MANUSCRIPT_FIGURE_DIRNAME = "manuscript_figures"
+INTERPRETATION_TARGETS = ["H2", "CO", "CO2", "CH4"]
+MONOTONIC_MODEL_NAMES = ["pyGAM_Mono", "EBM_Mono", "GA2M_Mono", "NAM_Mono"]
+MODEL_DISPLAY_NAMES = {
+    "pyGAM_Mono": "GAM-Mono",
+    "EBM_Mono": "EBM-Mono",
+    "GA2M_Mono": "GA2M-Mono",
+    "NAM_Mono": "NAM-Mono",
+}
+BIOMASS_FEATURES = ["C", "H", "O", "Ash", "Moisture"]
+OPERATING_FEATURES = ["T", "ER", "Steam/Biomass"]
+
+# Unified manuscript palette: blue for structural/main-effect information,
+# orange for highlighted responses/test data, and a blue-white-orange diverging
+# map for signed pairwise contributions.
+SCI_BLUE = "#355C9A"
+SCI_LIGHT_BLUE = "#8ECAE6"
+SCI_PALE_BLUE = "#D9ECF5"
+SCI_ORANGE = "#E76F51"
+SCI_LIGHT_ORANGE = "#F4A261"
+SCI_PALE_ORANGE = "#FBE3D8"
+SCI_DARK = "#263238"
+SCI_GRAY = "#7A7A7A"
+SCI_DIVERGING_CMAP = mpl.colors.LinearSegmentedColormap.from_list(
+    "sci_blue_white_orange",
+    [SCI_BLUE, "#F7F7F7", SCI_ORANGE],
+    N=256,
+)
+
+
+def _configure_publication_font() -> None:
+    """Use Matplotlib's bundled DejaVu Serif for portable, warning-free figures."""
+    import logging
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+    mpl.rcParams.update({
+        "font.family": "DejaVu Serif",
+        "font.serif": ["DejaVu Serif"],
+        "mathtext.fontset": "dejavuserif",
+        "axes.unicode_minus": False,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "svg.fonttype": "none",
+    })
+
+
+def _save_figure_bundle(fig, output_dir: str, stem: str) -> None:
+    """Save one figure as high-resolution raster and editable vector files."""
+    ensure_dir(output_dir)
+    base = os.path.join(output_dir, stem)
+    fig.savefig(base + ".png", dpi=600, bbox_inches="tight", pad_inches=0.08,
+                facecolor="white")
+    fig.savefig(base + ".pdf", bbox_inches="tight", pad_inches=0.08,
+                facecolor="white")
+    fig.savefig(base + ".svg", bbox_inches="tight", pad_inches=0.08,
+                facecolor="white")
+
+
+def _clean_manuscript_figure_dir(output_dir: str) -> str:
+    """Create a clean, self-contained folder containing only manuscript assets."""
+    manuscript_dir = os.path.join(output_dir, MANUSCRIPT_FIGURE_DIRNAME)
+    ensure_dir(manuscript_dir)
+    prefixes = ("Fig1_", "Fig2_", "Fig3_", "Fig4_", "FigS1_", "FigS2_", "FigS3_")
+    for name in os.listdir(manuscript_dir):
+        if name.startswith(prefixes):
+            path = os.path.join(manuscript_dir, name)
+            if os.path.isfile(path):
+                os.remove(path)
+    return manuscript_dir
+
+
+def _feature_display_name(feature: str) -> str:
+    return "S/B" if feature == "Steam/Biomass" else feature
+
+
+def _panel_letter(index: int) -> str:
+    return chr(ord("a") + index)
+
+
+
+def _style_panel(ax, grid: bool = True) -> None:
+    """Apply a consistent publication style to every manuscript subplot."""
+    ax.tick_params(
+        which="both",
+        direction="in",
+        top=True,
+        right=True,
+        labelsize=7.4,
+        width=0.7,
+        pad=2.5,
+    )
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.75)
+        spine.set_color(SCI_DARK)
+    if grid:
+        ax.grid(True, linestyle="--", linewidth=0.35, alpha=0.20, color=SCI_GRAY)
+    else:
+        ax.grid(False)
+    ax.set_axisbelow(True)
+
+def _compute_main_effect_table(model: GAMModelWrapper, X: np.ndarray,
+                               scaler: StandardScaler, target: str,
+                               n_grid: int = 120) -> pd.DataFrame:
+    """Compute isolated centered main effects from the fitted GA2M-Mono model."""
+    ebm = _unwrap_ebm(model)
+    term_features = _get_ebm_term_features(ebm)
+    main_term_map = {
+        term[0]: term_idx for term_idx, term in enumerate(term_features) if len(term) == 1
+    }
+    observed_terms = _eval_ebm_terms(ebm, X)
+    rows = []
+    for feature_idx in range(N_CONTINUOUS):
+        if feature_idx not in main_term_map:
+            continue
+        term_idx = main_term_map[feature_idx]
+        x_scaled = _make_feature_grid(X, feature_idx, n_grid)
+        x_original = inverse_transform_feature(scaler, feature_idx, x_scaled)
+        baseline = float(np.mean(observed_terms[:, term_idx]))
+        X_batch = np.repeat(X[np.newaxis, :, :], n_grid, axis=0)
+        X_batch[:, :, feature_idx] = x_scaled[:, np.newaxis]
+        term_batch = _eval_ebm_terms(ebm, X_batch.reshape(-1, X.shape[1]))
+        contribution = (
+            term_batch[:, term_idx].reshape(n_grid, X.shape[0]).mean(axis=1) - baseline
+        )
+        for xv, yv in zip(x_original, contribution):
+            rows.append({
+                "Target": target,
+                "Feature": CONTINUOUS_COLS[feature_idx],
+                "X": float(xv),
+                "MainEffectContribution": float(yv),
+            })
+    return pd.DataFrame(rows)
+
+
+def _compute_ice_pdp_tables(model: GAMModelWrapper, X: np.ndarray,
+                            scaler: StandardScaler, target: str,
+                            n_ice_lines: int = 50,
+                            n_grid: int = 60) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute full-sample PDP and a reproducible 50-sample ICE subset."""
+    target_offset = INTERPRETATION_TARGETS.index(target)
+    rng = np.random.default_rng(CFG.RANDOM_STATE + target_offset)
+    n_display = min(n_ice_lines, X.shape[0])
+    sample_indices = np.sort(rng.choice(X.shape[0], n_display, replace=False))
+    pdp_rows, ice_rows = [], []
+
+    for feature_idx in range(N_CONTINUOUS):
+        feature_name = CONTINUOUS_COLS[feature_idx]
+        x_scaled = _make_feature_grid(X, feature_idx, n_grid)
+        x_original = inverse_transform_feature(scaler, feature_idx, x_scaled)
+
+        X_all = np.repeat(X[np.newaxis, :, :], n_grid, axis=0)
+        X_all[:, :, feature_idx] = x_scaled[:, np.newaxis]
+        all_predictions = model.predict(
+            X_all.reshape(-1, X.shape[1])
+        ).reshape(n_grid, X.shape[0])
+        pdp = np.mean(all_predictions, axis=1)
+
+        X_display = X[sample_indices]
+        X_ice = np.repeat(X_display[np.newaxis, :, :], n_grid, axis=0)
+        X_ice[:, :, feature_idx] = x_scaled[:, np.newaxis]
+        ice_matrix = model.predict(
+            X_ice.reshape(-1, X.shape[1])
+        ).reshape(n_grid, n_display).T
+
+        for xv, yv in zip(x_original, pdp):
+            pdp_rows.append({
+                "Target": target,
+                "Feature": feature_name,
+                "X": float(xv),
+                "PDP": float(yv),
+            })
+        for line_idx, curve in enumerate(ice_matrix):
+            sample_idx = int(sample_indices[line_idx])
+            for xv, yv in zip(x_original, curve):
+                ice_rows.append({
+                    "Target": target,
+                    "Feature": feature_name,
+                    "SampleIndex": sample_idx,
+                    "X": float(xv),
+                    "ICE": float(yv),
+                })
+    return pd.DataFrame(pdp_rows), pd.DataFrame(ice_rows)
+
+
+def _compute_top_pairwise_records(model: GAMModelWrapper, X: np.ndarray,
+                                  scaler: StandardScaler, target: str,
+                                  top_n: int = 2,
+                                  grid_size: int = 50) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
+    """
+    Select the top retained continuous-continuous pairwise terms for Fig. 4.
+
+    Only continuous-continuous interactions are considered here so that Fig. 4
+    remains focused on interactions among process variables and biomass
+    characteristics. No fallback bed-material interaction is introduced.
+    """
+    importance_df = _get_term_importance_table(model, X)
+    all_pairwise = importance_df[
+        importance_df["FeatureIndices"].apply(
+            lambda term: isinstance(term, tuple) and len(term) == 2
+        )
+    ].copy().reset_index(drop=True)
+
+    continuous_pairs = all_pairwise[
+        all_pairwise["FeatureIndices"].apply(
+            lambda term: all(idx < N_CONTINUOUS for idx in term)
+        )
+    ].copy().reset_index(drop=True)
+
+    selected = continuous_pairs.head(top_n).copy().reset_index(drop=True)
+
+    records: List[Dict[str, Any]] = []
+    print(
+        f"      Retained pairwise terms for {target}: "
+        f"{len(continuous_pairs)} continuous-continuous / "
+        f"{len(all_pairwise)} total"
+    )
+
+    for rank, row in selected.iterrows():
+        feature_i, feature_j = tuple(row["FeatureIndices"])
+        print(
+            f"        [{rank + 1}/{len(selected)}] "
+            f"{_format_term_name((feature_i, feature_j))}"
+        )
+        record = _compute_pairwise_interaction_surface(
+            model=model,
+            X=X,
+            scaler=scaler,
+            term_idx=int(row["TermIndex"]),
+            feature_i=int(feature_i),
+            feature_j=int(feature_j),
+            grid_size=grid_size,
+        )
+        record.update({
+            "rank": int(rank + 1),
+            "importance": float(row["Importance"]),
+            "target": target,
+            "selection_type": "Continuous-continuous retained term",
+        })
+        records.append(record)
+
+    ranking = all_pairwise.copy()
+    ranking["ContinuousContinuous"] = ranking["FeatureIndices"].apply(
+        lambda term: all(idx < N_CONTINUOUS for idx in term)
+    )
+    chosen = set(selected["TermIndex"].astype(int).tolist())
+    ranking["SelectedForFig4"] = ranking["TermIndex"].astype(int).isin(chosen)
+    return records, ranking
+
+def _draw_isolated_interaction_panel(ax, record: Dict[str, Any], target: str,
+                                     panel_label: str,
+                                     vlim: float = None):
+    """Draw a retained pairwise contribution on continuous or binary axes."""
+    z = np.asarray(record["Z"], dtype=float)
+    vlim = max(
+        float(np.nanmax(np.abs(z))) if vlim is None else float(vlim),
+        1e-9,
+    )
+    norm = TwoSlopeNorm(vmin=-vlim, vcenter=0.0, vmax=vlim)
+    x_is_cat = bool(record.get("feature_i_is_categorical", False))
+    y_is_cat = bool(record.get("feature_j_is_categorical", False))
+
+    # Robust for both dense continuous grids and two-state one-hot grids.
+    mappable = ax.pcolormesh(
+        record["X_mesh"], record["Y_mesh"], z,
+        cmap=SCI_DIVERGING_CMAP, norm=norm,
+        shading="nearest", rasterized=True,
+    )
+
+    if (
+        z.shape[0] >= 3 and z.shape[1] >= 3
+        and float(np.nanmin(z)) <= 0.0 <= float(np.nanmax(z))
+    ):
+        ax.contour(
+            record["X_mesh"], record["Y_mesh"], z,
+            levels=[0.0], colors=SCI_DARK, linewidths=0.65,
+        )
+
+    ax.scatter(
+        record["observed_x"], record["observed_y"],
+        s=6.0, facecolors="none", edgecolors=SCI_DARK,
+        linewidths=0.28, alpha=0.18, rasterized=True,
+    )
+
+    def label(name: str, categorical: bool) -> str:
+        return f"{name} indicator" if categorical else FEATURE_UNITS.get(name, name)
+
+    ax.set_xlabel(label(record["feature_i_name"], x_is_cat), fontsize=8.0, labelpad=3.0)
+    ax.set_ylabel(label(record["feature_j_name"], y_is_cat), fontsize=8.0, labelpad=3.0)
+
+    if x_is_cat:
+        ax.set_xticks([0.0, 1.0])
+        ax.set_xticklabels(["Absent", "Present"], fontsize=7.0)
+        ax.set_xlim(-0.10, 1.10)
+    if y_is_cat:
+        ax.set_yticks([0.0, 1.0])
+        ax.set_yticklabels(["Absent", "Present"], fontsize=7.0)
+        ax.set_ylim(-0.10, 1.10)
+
+    pair_name = (
+        f"{_feature_display_name(record['feature_i_name'])} x "
+        f"{_feature_display_name(record['feature_j_name'])}"
+    )
+    ax.set_title(
+        f"{panel_label} {target}: {pair_name}",
+        loc="left", fontsize=8.6, fontweight="bold", pad=4,
+    )
+    _style_panel(ax, grid=False)
+    return mappable
+
+def _plot_fig1_feature_importance(feature_tables: Dict[str, pd.DataFrame],
+                                  manuscript_dir: str,
+                                  top_n: int = 12) -> None:
+    """Plot four target-specific term-importance rankings without label overlap."""
+    fig, axes = plt.subplots(2, 2, figsize=(8.8, 7.4), squeeze=False)
+    axes = axes.flatten()
+    palette = {
+        "Main effect": SCI_BLUE,
+        "Pairwise interaction": SCI_ORANGE,
+    }
+
+    for panel_idx, target in enumerate(INTERPRETATION_TARGETS):
+        ax = axes[panel_idx]
+        df_plot = feature_tables[target].head(top_n).copy().iloc[::-1]
+        y_pos = np.arange(len(df_plot))
+        colors = [palette.get(v, SCI_BLUE) for v in df_plot["TermType"]]
+
+        ax.barh(
+            y_pos,
+            df_plot["Importance"],
+            color=colors,
+            edgecolor=SCI_DARK,
+            linewidth=0.35,
+            height=0.68,
+        )
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(df_plot["Term"], fontsize=7.4)
+        ax.set_xlabel(
+            "Mean absolute term contribution",
+            fontsize=8.3,
+            labelpad=4.0,
+        )
+        ax.set_ylabel("Model term", fontsize=8.3, labelpad=4.0)
+        ax.set_title(
+            f"({_panel_letter(panel_idx)}) {target}",
+            loc="left",
+            fontsize=9.5,
+            fontweight="bold",
+            pad=4,
+        )
+        ax.set_xlim(left=0)
+        _style_panel(ax, grid=False)
+        ax.grid(axis="x", linestyle="--", linewidth=0.35, alpha=0.22, color=SCI_GRAY)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    handles = [
+        Patch(
+            facecolor=palette["Main effect"],
+            edgecolor=SCI_DARK,
+            linewidth=0.35,
+            label="Main effect",
+        ),
+        Patch(
+            facecolor=palette["Pairwise interaction"],
+            edgecolor=SCI_DARK,
+            linewidth=0.35,
+            label="Pairwise interaction",
+        ),
+    ]
+
+    # Put the legend in a dedicated upper margin rather than below x-axis labels.
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 0.995),
+        frameon=False,
+        fontsize=8.5,
+        columnspacing=1.8,
+        handlelength=1.8,
+    )
+    fig.tight_layout(rect=[0.02, 0.02, 0.995, 0.955], h_pad=1.7, w_pad=1.9)
+
+    _save_figure_bundle(fig, manuscript_dir, "Fig1_feature_importance")
+    plt.close(fig)
+
+    with pd.ExcelWriter(
+        os.path.join(manuscript_dir, "Fig1_feature_importance.xlsx")
+    ) as writer:
+        for target in INTERPRETATION_TARGETS:
+            export = feature_tables[target].copy()
+            export["FeatureIndices"] = export["FeatureIndices"].apply(
+                lambda value: ",".join(map(str, value))
+                if isinstance(value, (tuple, list, np.ndarray))
+                else ""
+            )
+            export.to_excel(writer, sheet_name=target, index=False)
+
+
+def _plot_shape_matrix(shape_tables: Dict[str, pd.DataFrame],
+                       contexts: Dict[str, Dict[str, Any]],
+                       features: List[str], manuscript_dir: str,
+                       figure_stem: str) -> None:
+    """Plot isolated main effects with full axis labels on every subplot."""
+    n_rows, n_cols = len(INTERPRETATION_TARGETS), len(features)
+    width = 13.0 if n_cols == 5 else 9.6
+    height = 9.5
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(width, height),
+        squeeze=False,
+    )
+
+    export_parts = []
+    panel_idx = 0
+    for row_idx, target in enumerate(INTERPRETATION_TARGETS):
+        table = shape_tables[target]
+        context = contexts[target]
+
+        for col_idx, feature in enumerate(features):
+            ax = axes[row_idx, col_idx]
+            sub = table[table["Feature"] == feature].sort_values("X")
+
+            ax.plot(
+                sub["X"],
+                sub["MainEffectContribution"],
+                color=SCI_BLUE,
+                linewidth=1.45,
+                zorder=3,
+            )
+            ax.fill_between(
+                sub["X"].to_numpy(),
+                0,
+                sub["MainEffectContribution"].to_numpy(),
+                color=SCI_LIGHT_BLUE,
+                alpha=0.24,
+                linewidth=0,
+                zorder=1,
+            )
+            ax.axhline(
+                0,
+                color=SCI_DARK,
+                linestyle="--",
+                linewidth=0.62,
+                alpha=0.68,
+                zorder=2,
+            )
+
+            # Every panel receives complete x and y labels.
+            ax.set_xlabel(
+                FEATURE_UNITS.get(feature, feature),
+                fontsize=7.8,
+                labelpad=3.0,
+            )
+            ax.set_ylabel(
+                f"{target} main-effect contribution\n[vol% N$_2$ free]",
+                fontsize=7.5,
+                labelpad=3.0,
+            )
+            ax.set_title(
+                f"({_panel_letter(panel_idx)}) {_feature_display_name(feature)}",
+                loc="left",
+                fontsize=8.4,
+                fontweight="bold",
+                pad=3,
+            )
+            _style_panel(ax, grid=True)
+
+            feature_idx = CONTINUOUS_COLS.index(feature)
+            observed_x = inverse_transform_feature(
+                context["scaler"],
+                feature_idx,
+                context["X"][:, feature_idx],
+            )
+            y0, y1 = ax.get_ylim()
+            rug_y = y0 + 0.025 * (y1 - y0 if y1 > y0 else 1.0)
+            ax.plot(
+                observed_x,
+                np.full_like(observed_x, rug_y),
+                "|",
+                color=SCI_DARK,
+                markersize=1.9,
+                markeredgewidth=0.32,
+                alpha=0.17,
+                clip_on=True,
+            )
+
+            panel_idx += 1
+            export_parts.append(sub.copy())
+
+    fig.tight_layout(rect=[0.02, 0.02, 0.995, 0.995], h_pad=1.25, w_pad=1.15)
+    _save_figure_bundle(fig, manuscript_dir, figure_stem)
+    plt.close(fig)
+
+    pd.concat(export_parts, ignore_index=True).to_excel(
+        os.path.join(manuscript_dir, figure_stem + ".xlsx"),
+        index=False,
+    )
+
+
+def _plot_ice_pdp_matrix(pdp_tables: Dict[str, pd.DataFrame],
+                         ice_tables: Dict[str, pd.DataFrame],
+                         features: List[str], manuscript_dir: str,
+                         figure_stem: str) -> None:
+    """Plot ICE/PDP matrices with a non-overlapping top legend."""
+    n_rows, n_cols = len(INTERPRETATION_TARGETS), len(features)
+    width = 13.0 if n_cols == 5 else 9.6
+    height = 9.6
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(width, height),
+        squeeze=False,
+    )
+
+    pdp_export, ice_export = [], []
+    panel_idx = 0
+
+    for row_idx, target in enumerate(INTERPRETATION_TARGETS):
+        for col_idx, feature in enumerate(features):
+            ax = axes[row_idx, col_idx]
+            ice_sub = ice_tables[target][
+                ice_tables[target]["Feature"] == feature
+            ]
+            pdp_sub = pdp_tables[target][
+                pdp_tables[target]["Feature"] == feature
+            ].sort_values("X")
+
+            for _, curve in ice_sub.groupby("SampleIndex", sort=False):
+                curve = curve.sort_values("X")
+                ax.plot(
+                    curve["X"],
+                    curve["ICE"],
+                    color=SCI_LIGHT_BLUE,
+                    alpha=0.18,
+                    linewidth=0.42,
+                    rasterized=True,
+                    zorder=1,
+                )
+
+            ax.plot(
+                pdp_sub["X"],
+                pdp_sub["PDP"],
+                color=SCI_ORANGE,
+                linewidth=1.70,
+                zorder=5,
+            )
+
+            # Every subplot receives its own complete x and y labels.
+            ax.set_xlabel(
+                FEATURE_UNITS.get(feature, feature),
+                fontsize=7.8,
+                labelpad=3.0,
+            )
+            ax.set_ylabel(
+                f"Predicted {target}\n[vol% N$_2$ free]",
+                fontsize=7.5,
+                labelpad=3.0,
+            )
+            ax.set_title(
+                f"({_panel_letter(panel_idx)}) {_feature_display_name(feature)}",
+                loc="left",
+                fontsize=8.4,
+                fontweight="bold",
+                pad=3,
+            )
+            _style_panel(ax, grid=True)
+
+            panel_idx += 1
+            pdp_export.append(pdp_sub.copy())
+            ice_export.append(ice_sub.copy())
+
+    handles = [
+        mpl.lines.Line2D(
+            [0],
+            [0],
+            color=SCI_LIGHT_BLUE,
+            linewidth=1.5,
+            alpha=0.85,
+            label="ICE (50 observations)",
+        ),
+        mpl.lines.Line2D(
+            [0],
+            [0],
+            color=SCI_ORANGE,
+            linewidth=1.9,
+            label="PDP (all observations)",
+        ),
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 0.995),
+        frameon=False,
+        fontsize=8.5,
+        columnspacing=2.0,
+        handlelength=2.0,
+    )
+    fig.tight_layout(rect=[0.02, 0.02, 0.995, 0.955], h_pad=1.25, w_pad=1.15)
+
+    _save_figure_bundle(fig, manuscript_dir, figure_stem)
+    plt.close(fig)
+
+    with pd.ExcelWriter(
+        os.path.join(manuscript_dir, figure_stem + ".xlsx")
+    ) as writer:
+        pd.concat(pdp_export, ignore_index=True).to_excel(
+            writer,
+            sheet_name="PDP",
+            index=False,
+        )
+        pd.concat(ice_export, ignore_index=True).to_excel(
+            writer,
+            sheet_name="ICE",
+            index=False,
+        )
+
+
+
+
+def _plot_fig4_pairwise(interaction_records: Dict[str, List[Dict[str, Any]]],
+                        pair_rankings: Dict[str, pd.DataFrame],
+                        manuscript_dir: str) -> None:
+    """Plot the two most important retained continuous pairwise terms for each gas target."""
+    n_rows, n_cols = len(INTERPRETATION_TARGETS), 2
+    fig = plt.figure(figsize=(9.8, 13.0))
+    grid = fig.add_gridspec(
+        nrows=n_rows,
+        ncols=n_cols + 1,
+        width_ratios=[1.0, 1.0, 0.055],
+        left=0.075,
+        right=0.955,
+        bottom=0.045,
+        top=0.985,
+        wspace=0.30,
+        hspace=0.42,
+    )
+
+    export_sheets: Dict[str, pd.DataFrame] = {}
+    panel_idx = 0
+
+    for row_idx, target in enumerate(INTERPRETATION_TARGETS):
+        axes = [fig.add_subplot(grid[row_idx, col]) for col in range(n_cols)]
+        cax = fig.add_subplot(grid[row_idx, n_cols])
+        records = interaction_records.get(target, [])[:n_cols]
+
+        if not records:
+            for ax in axes:
+                ax.axis("off")
+            axes[0].text(
+                0.5, 0.5, f"No retained continuous pairwise term for {target}",
+                transform=axes[0].transAxes, ha="center", va="center",
+                fontsize=8.2, color=SCI_GRAY,
+            )
+            cax.axis("off")
+            panel_idx += n_cols
+            continue
+
+        target_vlim = max(
+            max(float(np.nanmax(np.abs(np.asarray(record["Z"], dtype=float)))), 1e-9)
+            for record in records
+        )
+        row_mappable = None
+        rows = []
+
+        for col_idx, ax in enumerate(axes):
+            if col_idx >= len(records):
+                ax.axis("off")
+                panel_idx += 1
+                continue
+
+            record = records[col_idx]
+            row_mappable = _draw_isolated_interaction_panel(
+                ax, record, target, f"({_panel_letter(panel_idx)})",
+                vlim=target_vlim,
+            )
+            for iy, y_value in enumerate(record["y_original"]):
+                for ix, x_value in enumerate(record["x_original"]):
+                    rows.append({
+                        "Target": target,
+                        "Rank": int(record["rank"]),
+                        "Term": _format_term_name((record["feature_i"], record["feature_j"])),
+                        "X_Feature": record["feature_i_name"],
+                        "Y_Feature": record["feature_j_name"],
+                        "X": float(x_value),
+                        "Y": float(y_value),
+                        "PairwiseContribution": float(record["Z"][iy, ix]),
+                        "SelectionType": record.get("selection_type", "Continuous-continuous retained term"),
+                    })
+            panel_idx += 1
+
+        if rows:
+            export_sheets[target] = pd.DataFrame(rows)
+        if row_mappable is not None:
+            cbar = fig.colorbar(row_mappable, cax=cax)
+            cbar.set_label(
+                f"{target} pairwise contribution\n[vol% N$_2$ free]",
+                fontsize=7.3, labelpad=4,
+            )
+            cbar.ax.tick_params(labelsize=6.7, direction="in", pad=2)
+            cbar.outline.set_linewidth(0.65)
+        else:
+            cax.axis("off")
+
+    _save_figure_bundle(fig, manuscript_dir, "Fig4_pairwise_interactions")
+    plt.close(fig)
+
+    with pd.ExcelWriter(
+        os.path.join(manuscript_dir, "Fig4_pairwise_interactions.xlsx")
+    ) as writer:
+        for target in INTERPRETATION_TARGETS:
+            if target in export_sheets:
+                export_sheets[target].to_excel(
+                    writer,
+                    sheet_name=target,
+                    index=False,
+                )
+
+            ranking = pair_rankings.get(target)
+            if ranking is not None and not ranking.empty:
+                ranking_export = ranking.copy()
+                ranking_export["FeatureIndices"] = ranking_export["FeatureIndices"].apply(
+                    lambda value: ",".join(map(str, value))
+                    if isinstance(value, (tuple, list, np.ndarray)) else ""
+                )
+                ranking_export.to_excel(
+                    writer,
+                    sheet_name=(target + "_ranking")[:31],
+                    index=False,
+                )
+
+def _load_saved_best_fold_predictions(output_dir: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Load previously generated best-fold predictions without rerunning CV."""
+    loaded: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for target in TARGETS:
+        loaded[target] = {}
+        for model_name in MONOTONIC_MODEL_NAMES:
+            path = os.path.join(output_dir, target, f"{model_name}_{target}_predictions.xlsx")
+            if not os.path.exists(path):
+                continue
+            frame = pd.read_excel(path)
+            required = {"Set", "Actual", "Predicted"}
+            if not required.issubset(frame.columns):
+                continue
+            train = frame[frame["Set"].astype(str).str.lower() == "train"]
+            test = frame[frame["Set"].astype(str).str.lower() == "test"]
+            if train.empty or test.empty:
+                continue
+            loaded[target][model_name] = {
+                "y_train": train["Actual"].to_numpy(dtype=float),
+                "y_pred_train": train["Predicted"].to_numpy(dtype=float),
+                "y_test": test["Actual"].to_numpy(dtype=float),
+                "y_pred_test": test["Predicted"].to_numpy(dtype=float),
+                "fold": np.nan,
+            }
+    return loaded
+
+
+
+
+def _plot_figS1_best_fold(predictions: Dict[str, Dict[str, Dict[str, Any]]],
+                          manuscript_dir: str) -> None:
+    """Plot best-fold parity panels with letters outside the upper-left corner."""
+    available = any(predictions.get(t) for t in TARGETS)
+    if not available:
+        print(
+            "  WARNING: Fig S1 was not generated because saved best-fold "
+            "prediction files were not found."
+        )
+        return
+
+    fig, axes = plt.subplots(
+        len(TARGETS), len(MONOTONIC_MODEL_NAMES),
+        figsize=(11.6, 14.2), squeeze=False,
+    )
+    export_rows = []
+    panel_idx = 0
+
+    for row_idx, target in enumerate(TARGETS):
+        for col_idx, model_name in enumerate(MONOTONIC_MODEL_NAMES):
+            ax = axes[row_idx, col_idx]
+            rec = predictions.get(target, {}).get(model_name)
+
+            if rec is None:
+                ax.text(
+                    0.5, 0.5, "Prediction file not found",
+                    transform=ax.transAxes, ha="center", va="center", fontsize=7,
+                )
+                ax.set_xlabel(f"Measured {target}", fontsize=7.5)
+                ax.set_ylabel(f"Predicted {target}", fontsize=7.5)
+                _style_panel(ax, grid=False)
+                panel_idx += 1
+                continue
+
+            y_train, p_train = rec["y_train"], rec["y_pred_train"]
+            y_test, p_test = rec["y_test"], rec["y_pred_test"]
+            all_values = np.concatenate([y_train, p_train, y_test, p_test])
+            lo, hi = float(np.nanmin(all_values)), float(np.nanmax(all_values))
+            pad = 0.045 * (hi - lo if hi > lo else 1.0)
+            limits = [lo - pad, hi + pad]
+
+            ax.scatter(
+                y_train, p_train, s=8, color=SCI_LIGHT_BLUE,
+                alpha=0.42, edgecolors="none", rasterized=True, zorder=2,
+            )
+            ax.scatter(
+                y_test, p_test, s=15, color=SCI_ORANGE,
+                alpha=0.78, edgecolors="white", linewidths=0.25,
+                rasterized=True, zorder=3,
+            )
+            ax.plot(limits, limits, color=SCI_DARK, linewidth=0.75, zorder=1)
+            ax.set_xlim(limits)
+            ax.set_ylim(limits)
+            ax.set_aspect("equal", adjustable="box")
+
+            ax.text(
+                0.05, 0.93,
+                f"Test $R^2$ = {r2_score(y_test, p_test):.3f}",
+                transform=ax.transAxes, ha="left", va="top", fontsize=7.1,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.82, pad=1.4),
+            )
+
+            if row_idx == 0:
+                ax.set_title(
+                    MODEL_DISPLAY_NAMES[model_name],
+                    loc="center", fontsize=9.0, fontweight="bold", pad=6,
+                )
+
+            # Letter is outside the plotting rectangle, at its upper-left corner.
+            ax.text(
+                -0.11, 1.06,
+                f"({_panel_letter(panel_idx)})",
+                transform=ax.transAxes, ha="left", va="bottom",
+                fontsize=7.8, fontweight="bold", clip_on=False,
+            )
+
+            ax.set_xlabel(f"Measured {target}", fontsize=7.5, labelpad=3.0)
+            ax.set_ylabel(f"Predicted {target}", fontsize=7.5, labelpad=3.0)
+            _style_panel(ax, grid=False)
+
+            for set_name, actual, predicted in (
+                ("Train", y_train, p_train), ("Test", y_test, p_test)
+            ):
+                for actual_value, predicted_value in zip(actual, predicted):
+                    export_rows.append({
+                        "Target": target,
+                        "Model": MODEL_DISPLAY_NAMES[model_name],
+                        "Set": set_name,
+                        "Actual": float(actual_value),
+                        "Predicted": float(predicted_value),
+                    })
+            panel_idx += 1
+
+    handles = [
+        mpl.lines.Line2D([0], [0], marker="o", linestyle="none", markersize=5,
+                         markerfacecolor=SCI_LIGHT_BLUE, markeredgecolor="none",
+                         alpha=0.80, label="Training"),
+        mpl.lines.Line2D([0], [0], marker="o", linestyle="none", markersize=5,
+                         markerfacecolor=SCI_ORANGE, markeredgecolor="white",
+                         label="Test"),
+        mpl.lines.Line2D([0], [0], color=SCI_DARK, linewidth=0.8, label="1:1 line"),
+    ]
+    fig.legend(
+        handles=handles, loc="upper center", ncol=3,
+        bbox_to_anchor=(0.5, 0.995), frameon=False,
+        fontsize=8.4, columnspacing=1.8, handlelength=1.8,
+    )
+    fig.tight_layout(
+        rect=[0.025, 0.02, 0.995, 0.958],
+        h_pad=1.75, w_pad=1.40,
+    )
+
+    _save_figure_bundle(fig, manuscript_dir, "FigS1_predicted_vs_measured")
+    plt.close(fig)
+    pd.DataFrame(export_rows).to_excel(
+        os.path.join(manuscript_dir, "FigS1_predicted_vs_measured.xlsx"),
+        index=False,
+    )
+
+def generate_manuscript_figures_v2(df: pd.DataFrame,
+                                   models: List[GAMModelWrapper],
+                                   output_dir: str,
+                                   best_fold_predictions: Dict[str, Dict[str, Dict[str, Any]]] = None) -> None:
+    """Generate only the seven manuscript figures and their paired Excel files."""
+    _configure_publication_font()
+    manuscript_dir = _clean_manuscript_figure_dir(output_dir)
+    model_template = next((m for m in models if m.name == "GA2M_Mono"), None)
+    if model_template is None:
+        raise RuntimeError("GA2M_Mono is unavailable. Install a compatible InterpretML version.")
+
+    feature_tables: Dict[str, pd.DataFrame] = {}
+    shape_tables: Dict[str, pd.DataFrame] = {}
+    pdp_tables: Dict[str, pd.DataFrame] = {}
+    ice_tables: Dict[str, pd.DataFrame] = {}
+    contexts: Dict[str, Dict[str, Any]] = {}
+    interaction_records: Dict[str, List[Dict[str, Any]]] = {}
+    pair_rankings: Dict[str, pd.DataFrame] = {}
+
+    print("\n[7] Refitting GA2M-Mono on all available samples for interpretation...")
+    for target in INTERPRETATION_TARGETS:
+        print(f"  Target: {target}")
+        target_data = split_target(df, target)
+        scaler = fit_scaler(target_data)
+        X = transform_features(target_data, scaler)
+        y = target_data[target].to_numpy(dtype=float)
+        model = model_template.clone()
+        model.fit(X, y, target=target)
+        contexts[target] = {"X": X, "scaler": scaler}
+        feature_tables[target] = _get_term_importance_table(model, X)
+        shape_tables[target] = _compute_main_effect_table(model, X, scaler, target)
+        pdp_tables[target], ice_tables[target] = _compute_ice_pdp_tables(
+            model, X, scaler, target
+        )
+        interaction_records[target], pair_rankings[target] = _compute_top_pairwise_records(
+            model, X, scaler, target, top_n=2, grid_size=50
+        )
+
+    print("\n  Exporting manuscript-ready figures and Excel files...")
+    _plot_fig1_feature_importance(feature_tables, manuscript_dir)
+    _plot_shape_matrix(shape_tables, contexts, BIOMASS_FEATURES,
+                       manuscript_dir, "Fig2_shape_biomass_characteristics")
+    _plot_shape_matrix(shape_tables, contexts, OPERATING_FEATURES,
+                       manuscript_dir, "Fig3_shape_operating_parameters")
+    _plot_fig4_pairwise(interaction_records, pair_rankings, manuscript_dir)
+    if best_fold_predictions is None:
+        best_fold_predictions = _load_saved_best_fold_predictions(output_dir)
+    _plot_figS1_best_fold(best_fold_predictions, manuscript_dir)
+    _plot_ice_pdp_matrix(pdp_tables, ice_tables, BIOMASS_FEATURES,
+                         manuscript_dir, "FigS2_ice_pdp_biomass_characteristics")
+    _plot_ice_pdp_matrix(pdp_tables, ice_tables, OPERATING_FEATURES,
+                         manuscript_dir, "FigS3_ice_pdp_operating_parameters")
+
+    readme = os.path.join(manuscript_dir, "README_manuscript_figures.txt")
+    with open(readme, "w", encoding="utf-8") as handle:
+        handle.write(
+            "This folder contains only manuscript figures and their paired Excel data.\n"
+            "Fig1: feature importance (four gas targets)\n"
+            "Fig2: main-effect functions of biomass characteristics\n"
+            "Fig3: main-effect functions of operating parameters\n"
+            "Fig4: three retained pairwise interactions for each gas target; "
+            "continuous pairs are prioritized and bed-related retained terms fill missing slots\n"
+            "FigS1: predicted-versus-measured plots from saved best-fold predictions\n"
+            "FigS2: ICE/PDP of biomass characteristics\n"
+            "FigS3: ICE/PDP of operating parameters\n\n"
+            "Cross-validation metrics are generated by the full workflow before the interpretation figures.\n"
+            "Standalone Table 3 is saved under ../manuscript_tables/.\n"
+        )
+    print(f"  Done. Manuscript assets: {manuscript_dir}")
+
+
+
+def generate_manuscript_table3(df_all: pd.DataFrame, save_dir: str) -> str:
+    """
+    Export manuscript-ready Table 3 as a standalone Excel workbook.
+
+    The best split for each model-target combination is defined exactly as in the
+    prediction-plot workflow: the fold with the highest Test_R2. The value before
+    "/" is the five-fold mean, and the value after "/" is the metric from that
+    best-performing fold. GY PhysRate is shown as "-" because no directional
+    monotonicity constraints are imposed on GY.
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    required_cols = {
+        "Model", "Target", "Fold",
+        "Train_R2", "Train_RMSE", "Train_PhysRate",
+        "Test_R2", "Test_RMSE", "Test_PhysRate",
+    }
+    missing = sorted(required_cols.difference(df_all.columns))
+    if missing:
+        raise ValueError(f"Cannot generate Table 3; missing columns: {missing}")
+
+    table_dir = os.path.join(save_dir, "manuscript_tables")
+    ensure_dir(table_dir)
+    output_path = os.path.join(table_dir, "Table3_Predictive_Performance.xlsx")
+    csv_path = os.path.join(table_dir, "Table3_Predictive_Performance.csv")
+
+    model_order = [
+        "pyGAM", "pyGAM_Mono", "EBM", "EBM_Mono",
+        "GA2M", "GA2M_Mono", "NAM", "NAM_Mono",
+    ]
+    model_display = {
+        "pyGAM": "GAM",
+        "pyGAM_Mono": "GAM-Mono",
+        "EBM": "EBM",
+        "EBM_Mono": "EBM-Mono",
+        "GA2M": "GA2M",
+        "GA2M_Mono": "GA2M-Mono",
+        "NAM": "NAM",
+        "NAM_Mono": "NAM-Mono",
+    }
+    target_order = ["H2", "CO", "CO2", "CH4", "GY"]
+    metric_rows = [
+        ("Train R2 (Average/ Best Split)", "Train_R2", 4),
+        ("Train RMSE (Average/ Best Split)", "Train_RMSE", 4),
+        ("Train PhysRate (%, Average/ Best Split)", "Train_PhysRate", 2),
+        ("Test R2 (Average/ Best Split)", "Test_R2", 4),
+        ("Test RMSE (Average/ Best Split)", "Test_RMSE", 4),
+        ("Test PhysRate (%, Average/ Best Split)", "Test_PhysRate", 2),
+    ]
+
+    display_rows = []
+    detail_rows = []
+    best_fold_rows = []
+
+    for target in target_order:
+        for model in model_order:
+            subset = df_all[
+                (df_all["Target"] == target) &
+                (df_all["Model"] == model)
+            ].copy()
+            if subset.empty:
+                raise ValueError(f"No fold results found for target={target}, model={model}")
+            valid_subset = subset.dropna(subset=["Test_R2"])
+            if valid_subset.empty:
+                raise ValueError(
+                    f"All Test_R2 values are missing for target={target}, model={model}"
+                )
+
+            best_idx = valid_subset["Test_R2"].astype(float).idxmax()
+            best_row = valid_subset.loc[best_idx]
+            best_fold_rows.append({
+                "Target": target,
+                "Model": model_display[model],
+                "Best_Fold": int(best_row["Fold"]),
+                "Best_Test_R2": float(best_row["Test_R2"]),
+            })
+
+            detail = {
+                "Target": target,
+                "Model": model_display[model],
+                "Best_Fold": int(best_row["Fold"]),
+            }
+            for _, metric_col, _ in metric_rows:
+                detail[f"{metric_col}_Average"] = float(subset[metric_col].mean())
+                detail[f"{metric_col}_BestSplit"] = float(best_row[metric_col])
+            detail_rows.append(detail)
+
+        for metric_label, metric_col, decimals in metric_rows:
+            row = {
+                "Syngas component": target,
+                "Statistical metrics": metric_label,
+            }
+            for model in model_order:
+                subset = df_all[
+                    (df_all["Target"] == target) &
+                    (df_all["Model"] == model)
+                ].copy()
+                valid_subset = subset.dropna(subset=["Test_R2"])
+                if valid_subset.empty:
+                    raise ValueError(
+                        f"All Test_R2 values are missing for target={target}, model={model}"
+                    )
+                best_idx = valid_subset["Test_R2"].astype(float).idxmax()
+                best_row = valid_subset.loc[best_idx]
+
+                if target == "GY" and "PhysRate" in metric_col:
+                    value = "-"
+                else:
+                    avg_value = float(subset[metric_col].mean())
+                    best_value = float(best_row[metric_col])
+                    value = f"{avg_value:.{decimals}f}/{best_value:.{decimals}f}"
+                row[model_display[model]] = value
+            display_rows.append(row)
+
+    display_columns = (
+        ["Syngas component", "Statistical metrics"] +
+        [model_display[m] for m in model_order]
+    )
+    display_df = pd.DataFrame(display_rows, columns=display_columns)
+    detail_df = pd.DataFrame(detail_rows)
+    best_fold_df = pd.DataFrame(best_fold_rows)
+    source_cols = [
+        "Target", "Model", "Fold",
+        "Train_R2", "Train_RMSE", "Train_PhysRate",
+        "Test_R2", "Test_RMSE", "Test_PhysRate",
+    ]
+    source_df = df_all[source_cols].copy().sort_values(["Target", "Model", "Fold"])
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        display_df.to_excel(writer, sheet_name="Table3", index=False, startrow=1)
+        detail_df.to_excel(writer, sheet_name="Numeric_Detail", index=False)
+        best_fold_df.to_excel(writer, sheet_name="Best_Fold_Index", index=False)
+        source_df.to_excel(writer, sheet_name="Fold_Level_Source", index=False)
+
+    display_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    # Formatting is optional. The plain workbook and CSV have already been
+    # written above, so a version-specific openpyxl formatting problem must
+    # never stop the numerical workflow or remove Table 3.
+    try:
+        wb = load_workbook(output_path)
+        ws = wb["Table3"]
+
+        # Title.
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(display_columns))
+        title_cell = ws.cell(1, 1)
+        title_cell.value = "Table 3. Predictive Performance of GAMs and GAMs-Mono"
+        title_cell.font = Font(name="Arial", size=12, bold=True)
+        title_cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 24
+
+        # Styles.
+        header_fill = PatternFill("solid", fgColor="1F4E78")
+        group_fills = [
+            PatternFill("solid", fgColor="EAF2F8"),
+            PatternFill("solid", fgColor="F8F9F9"),
+        ]
+        white_font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+        body_font = Font(name="Arial", size=9)
+        thin_gray = Side(style="thin", color="B7B7B7")
+        border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+
+        header_row = 2
+        for cell in ws[header_row]:
+            cell.fill = header_fill
+            cell.font = white_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+        ws.row_dimensions[header_row].height = 36
+
+        # Merge target labels and apply alternating target-group fills.
+        first_data_row = 3
+        rows_per_target = len(metric_rows)
+        for target_idx, target in enumerate(target_order):
+            start_row = first_data_row + target_idx * rows_per_target
+            end_row = start_row + rows_per_target - 1
+            ws.merge_cells(start_row=start_row, start_column=1, end_row=end_row, end_column=1)
+            target_cell = ws.cell(start_row, 1)
+            target_cell.value = target
+            target_font = Font(name="Arial", size=10, bold=True)
+            target_cell.font = target_font
+            target_cell.alignment = Alignment(horizontal="center", vertical="center")
+            fill = group_fills[target_idx % 2]
+            for row_idx in range(start_row, end_row + 1):
+                for col_idx in range(1, len(display_columns) + 1):
+                    cell = ws.cell(row_idx, col_idx)
+                    cell.fill = fill
+                    cell.font = body_font if col_idx != 1 else target_font
+                    cell.border = border
+                    cell.alignment = Alignment(
+                        horizontal="left" if col_idx == 2 else "center",
+                        vertical="center",
+                        wrap_text=True,
+                    )
+                ws.row_dimensions[row_idx].height = 28
+
+        # Column widths.
+        widths = {
+            1: 18,
+            2: 40,
+        }
+        for col_idx in range(3, len(display_columns) + 1):
+            widths[col_idx] = 16
+        for col_idx, width in widths.items():
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        ws.freeze_panes = "C3"
+        ws.sheet_view.showGridLines = False
+        ws.auto_filter.ref = f"A2:{get_column_letter(len(display_columns))}{ws.max_row}"
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_title_rows = "1:2"
+
+        # Format supporting sheets.
+        for sheet_name in ["Numeric_Detail", "Best_Fold_Index", "Fold_Level_Source"]:
+            sheet = wb[sheet_name]
+            sheet.freeze_panes = "A2"
+            sheet.sheet_view.showGridLines = False
+            for cell in sheet[1]:
+                cell.fill = header_fill
+                cell.font = white_font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = border
+            for row in sheet.iter_rows(min_row=2):
+                for cell in row:
+                    cell.font = body_font
+                    cell.border = border
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    if isinstance(cell.value, float):
+                        cell.number_format = "0.0000"
+            for col_idx in range(1, sheet.max_column + 1):
+                max_len = max(
+                    len(str(sheet.cell(row_idx, col_idx).value or ""))
+                    for row_idx in range(1, min(sheet.max_row, 200) + 1)
+                )
+                sheet.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 12), 24)
+
+        wb.save(output_path)
+    except Exception as exc:
+        print(
+            "    WARNING: Table 3 data were exported, but optional Excel "
+            f"formatting was skipped: {type(exc).__name__}: {exc}"
+        )
+
+    readme_path = os.path.join(table_dir, "README_Table3.txt")
+    with open(readme_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "Table3_Predictive_Performance.xlsx contains:\n"
+            "1. Table3: manuscript-ready Average/Best Split table.\n"
+            "2. Numeric_Detail: separate numeric average and best-split values.\n"
+            "3. Best_Fold_Index: selected fold for every target-model combination.\n"
+            "4. Fold_Level_Source: fold-level source values used to construct Table 3.\n\n"
+            "Best split is selected by the highest Test_R2 for each model-target combination.\n"
+            "GY PhysRate is displayed as '-' because no monotonic constraints are applied to GY.\n"
+        )
+
+    print(f"    Standalone Table 3 saved to: {output_path}")
+    return output_path
+
+def _run_original_full_pipeline_then_figures() -> None:
+    """Original numerical workflow, followed by the new manuscript figure exporter."""
+    set_seed(CFG.RANDOM_STATE)
+    ensure_dir(CFG.OUTPUT_DIR)
+    print("=" * 60)
+    print("Multi-GAM Model Comparison Study")
+    print("(With and Without Monotonic Constraints)")
+    print("=" * 60)
+    print("\n[1] Loading data...")
+    df = load_and_prepare_data()
+    print("\n[2] Checking available models...")
+    models = get_available_models(include_monotonic=True)
+    if not models:
+        print("ERROR: No models available.")
+        return
+    print(f"\n{len(models)} model variants available")
+    print("\n[3] Running cross-validation...")
+    all_results = []
+    best_fold_preds_all: Dict[str, Dict] = {}
+    for target in TARGETS:
+        df_results, best_fold_preds = run_cv_comparison(
+            df, target, models, n_folds=CFG.N_FOLDS
+        )
+        if not df_results.empty:
+            all_results.append(df_results)
+        best_fold_preds_all[target] = best_fold_preds
+    if not all_results:
+        print("ERROR: No results.")
+        return
+    df_all = pd.concat(all_results, ignore_index=True)
+    df_all.to_excel(os.path.join(CFG.OUTPUT_DIR, "cv_results_raw.xlsx"), index=False)
+    print("\n[4] Aggregating results...")
+    df_agg = aggregate_results(df_all)
+    df_agg.to_excel(os.path.join(CFG.OUTPUT_DIR, "cv_results_aggregated.xlsx"), index=False)
+    print("\n[4.1] Exporting standalone manuscript Table 3...")
+    generate_manuscript_table3(df_all, CFG.OUTPUT_DIR)
+    print("\n[5] Training final models (scatter plots use best CV fold per model)...")
+    for target in TARGETS:
+        target_dir = os.path.join(CFG.OUTPUT_DIR, target)
+        ensure_dir(target_dir)
+        train_final_models(
+            df, target, models, target_dir,
+            best_fold_preds=best_fold_preds_all.get(target, {})
+        )
+    print("\n[6] Generating comparison plots...")
+    for target in TARGETS:
+        plot_comparison_boxplot(df_all, target, CFG.OUTPUT_DIR)
+    plot_overall_heatmap(df_agg, "RMSE", CFG.OUTPUT_DIR)
+    plot_overall_heatmap(df_agg, "R2", CFG.OUTPUT_DIR)
+    plot_overall_heatmap(df_agg, "PhysRate", CFG.OUTPUT_DIR)
+    generate_comprehensive_fold_summary(df_all, CFG.OUTPUT_DIR)
+    generate_manuscript_figures_v2(
+        df, models, CFG.OUTPUT_DIR, best_fold_predictions=best_fold_preds_all
+    )
+    print("\n" + "=" * 60)
+    print(f"Complete! Results saved to: {CFG.OUTPUT_DIR}/")
+    print("=" * 60)
+
+
+def main() -> None:
+    """Run the complete numerical and manuscript-figure workflow once."""
+    _run_original_full_pipeline_then_figures()
 
 
 if __name__ == "__main__":
