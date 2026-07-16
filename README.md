@@ -1,183 +1,282 @@
-# Multi-GAM Model Comparison for Biomass Gasification
+# Physically Constrained GAMs for Interpretable Biomass Gasification Prediction
 
-This repository contains code for a systematic comparison of generalized additive models (GAMs) applied to biomass gasification product prediction. The script evaluates four GAM families—with and without monotonic constraints—via cross-validation, physical conformity assessment, interpretability analysis, and publication-ready visualization.
+This repository contains the complete Python workflow used to compare generalized additive model (GAM) family methods for biomass gasification prediction, with and without monotonic constraints.
 
-## Overview
+The workflow evaluates four additive model families:
 
-The study predicts five target variables from biomass gasification experiments:
+- **GAM** implemented with `pyGAM`
+- **EBM** implemented with `InterpretML`
+- **GA2M** implemented with `InterpretML`
+- **NAM** implemented with `PyTorch`
 
-| Symbol | Description |
-|--------|-------------|
-| H2 | Hydrogen volume fraction (N₂-free) |
-| CO | Carbon monoxide volume fraction |
-| CO2 | Carbon dioxide volume fraction |
-| CH4 | Methane volume fraction |
-| GY | Gas yield [Nm³/kg daf] |
+Each model is evaluated in unconstrained and monotonic forms. The prediction targets are H₂, CO, CO₂, CH₄, and gas yield (GY).
 
-## Models Compared
+## Main functions
 
-**4 base models × 2 variants = 8 model configurations:**
+The code performs the following steps:
 
-| Model | Monotonic variant | Description |
-|-------|-------------------|-------------|
-| EBM | EBM_Mono | Explainable Boosting Machine (InterpretML) |
-| pyGAM | pyGAM_Mono | Classical spline-based GAM |
-| GA2M | GA2M_Mono | GA²M with pairwise interactions |
-| NAM | NAM_Mono | Neural Additive Model (PyTorch) |
+1. Loads and merges the gas composition and gas yield worksheets.
+2. Converts gasification temperature from °C to K.
+3. Removes extreme input outliers using a z-score threshold of ±5.
+4. One-hot encodes the four bed material categories.
+5. Standardizes continuous variables using training-set statistics only.
+6. Evaluates eight model variants using five-fold cross-validation.
+7. Calculates R², RMSE, MAE, MAPE, and physical trend conformity rate (PhysRate).
+8. Selects the best split for each model–target combination using the highest test R².
+9. Saves fitted models, scalers, predictions, tables, and publication-quality figures.
+10. Refits GA2M-Mono on all available preprocessed samples for intrinsic interpretability analysis.
+11. Generates term importance, main-effect, ICE/PDP, and pairwise interaction results.
 
-- Unsuffixed names: standard fitting
-- `_Mono` suffix: monotonic constraints derived from physical trends in the literature
+## Repository structure
 
-## Input Features
+A recommended repository structure is:
 
-**Continuous (8 features, Z-score standardized before fitting):**
+```text
+.
+├── GAMs.py
+├── Data of biomass gasification.xlsx
+├── README.md
+└── results_gam_comparison/          # Generated after execution
+```
 
-- `T` — Temperature [K] (converted automatically from °C)
-- `ER` — Equivalence ratio
-- `Steam/Biomass` — Steam-to-biomass ratio
-- `C`, `H`, `O`, `Ash`, `Moisture` — Elemental composition, ash, and moisture [wt% db]
-
-**Categorical (one-hot encoded):**
-
-- `Bed material` — Bed material type, values 1–4
+Rename the provided Python code to `GAMs.py`, or update the command below to match the actual script name.
 
 ## Requirements
 
-- Python ≥ 3.8
-- Missing optional packages cause the corresponding model to be skipped automatically
+Python 3.10 or later is recommended.
 
-| Package | Purpose | Models |
-|---------|---------|--------|
-| numpy, pandas, scikit-learn | Data handling and metrics | All |
-| matplotlib, scipy | Plotting and statistics | All |
-| openpyxl | Excel I/O | All |
-| joblib | Model serialization | All |
-| interpret | EBM / GA2M backend | EBM, GA2M |
-| pygam | Spline GAM | pyGAM |
-| torch | Neural networks | NAM |
-
-Install example:
+Install the required packages with:
 
 ```bash
-pip install numpy pandas scikit-learn matplotlib scipy openpyxl joblib interpret pygam torch
+pip install numpy pandas scipy matplotlib scikit-learn openpyxl joblib interpret pygam torch
 ```
 
-## Data File
+A recent version of `InterpretML` is recommended because the interpretation workflow uses fitted-term metadata and term-level evaluation functions.
 
-Place the Excel workbook in the same directory as the script. Default filename:
+GPU acceleration is optional. NAM automatically uses CUDA when it is available and otherwise runs on the CPU.
 
-```
+## Input data
+
+The default input file is:
+
+```text
 Data of biomass gasification.xlsx
 ```
 
-Required sheets:
+It must be placed in the same directory as the Python script unless `CFG.DATA_PATH` is changed.
 
-| Sheet name | Content |
-|------------|---------|
-| `data of %` | H2, CO, CO2, CH4, and process/composition inputs |
-| `data of GY` | Gas yield (GY) and corresponding inputs |
+### Required worksheets
 
-Column names must match the mappings in `merge_sheets()` (e.g. `(x1)T [ºC]`, `(x2)ER [-]`). Override the path via `CFG.DATA_PATH` if needed.
+The workbook must contain:
 
-## Quick Start
-
-1. Rename `投稿代码.txt` to `gam_comparison.py` (or run the `.txt` file directly with Python).
-2. Ensure the data file is in the working directory.
-3. Run:
-
-```bash
-python gam_comparison.py
+```text
+data of %
+data of GY
 ```
 
-All outputs are written to `results_gam_comparison/` (configurable via `CFG.OUTPUT_DIR`).
+The two worksheets are merged according to their row order. Their corresponding records should therefore remain aligned.
 
-## Workflow
+### Required input columns
 
-The script runs the following steps automatically:
-
-1. **Load data** — Merge both sheets, encode bed material, apply Z-score outlier filtering (5σ threshold)
-2. **Detect available models** — Load up to 8 variants depending on installed dependencies
-3. **5-fold cross-validation** — Per target: RMSE, MAE, R², MAPE, and physical conformity (PhysRate)
-4. **Aggregate results** — Export per-fold and summary Excel tables
-5. **Train final models** — Save models; scatter and residual plots use each model's best CV fold
-6. **Comparison plots** — Boxplots and heatmaps (RMSE, R², PhysRate)
-7. **Best-model analysis** — Shape functions, ICE/PDP, and bivariate 3D surfaces (28 continuous-feature pairs)
-8. **Fold-level summary** — Multi-sheet Excel report
-
-## Output Structure
-
-```
-results_gam_comparison/
-├── cv_results_raw.xlsx              # Per-fold raw results
-├── cv_results_aggregated.xlsx       # Aggregated model × target statistics
-├── comprehensive_fold_summary.xlsx  # Multi-sheet fold-level summary
-├── heatmap_RMSE.png / .pdf / .xlsx
-├── heatmap_R2.png / .pdf / .xlsx
-├── heatmap_PhysRate.png / .pdf / .xlsx
-├── {H2,CO,CO2,CH4,GY}_comparison_boxplot.png / .pdf
-├── {target}/
-│   ├── saved_models/                # joblib models and scalers
-│   ├── prediction_scripts/          # Standalone prediction scripts
-│   ├── {Model}_{target}_scatter.png / .pdf
-│   ├── {Model}_{target}_residuals.png / .pdf
-│   ├── {Model}_{target}_feature_importance.png / .pdf / .xlsx
-│   └── best_model_analysis/         # Shape functions, ICE/PDP, 3D plots for best model
-│       └── bivariate_3d/            # 28 bivariate 3D surface plots
+```text
+(x1)T [ºC]
+(x2)ER [-]
+(x3)Steam/Biomass
+(x4)C [%wt db]
+(x5)H [%wt db]
+(x6)O [%wt db]
+(x7)Ash [%wt db]
+(x8)Moisture [%wt]
+Bed material
 ```
 
-## Monotonic Constraints
+`Bed material` should use the category labels `1`, `2`, `3`, and `4`.
 
-`_Mono` models enforce sign constraints on continuous features (`+1` increasing, `-1` decreasing, `0` unconstrained):
+### Required target columns
 
-| Target | T | ER | Moisture |
-|--------|---|----|----------|
-| H2 | ↑ | ↓ | ↑ |
-| CO | ↑ | ↓ | ↓ |
-| CO2 | ↓ | ↑ | ↑ |
-| CH4 | — | ↓ | ↑ |
-| GY | — | — | — |
-
-Steam/Biomass and elemental features (C, H, O, Ash) are unconstrained. No monotonic constraints are applied for GY.
-
-**PhysRate** (physical conformity rate): percentage of test samples for which the numerical gradient of the model prediction aligns with the expected sign for constrained features.
-
-## Using Prediction Scripts
-
-A standalone script is generated for each model–target pair, e.g.:
-
-```
-results_gam_comparison/H2/prediction_scripts/predict_EBM_Mono_H2.py
+```text
+H2 [%vol N2 free]
+CO [%vol N2 free]
+CO2 [%vol N2 free]
+CH4 [%vol N2 free]
+GY [Nm3/kg daf]
 ```
 
-Interactive example:
-
-```bash
-cd results_gam_comparison/H2/prediction_scripts
-python predict_EBM_Mono_H2.py
-```
-
-Enter T [K], ER, Steam/Biomass, elemental composition, moisture, and bed material (1–4) when prompted.
+Rows with a missing value for a given target are excluded only from the model developed for that target.
 
 ## Configuration
 
-Key settings in the `CFG` class:
+The main settings are defined in the `CFG` class:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `DATA_PATH` | `Data of biomass gasification.xlsx` | Input data path |
-| `OUTPUT_DIR` | `results_gam_comparison` | Output directory |
-| `N_FOLDS` | `5` | Cross-validation folds |
-| `RANDOM_STATE` | `42` | Random seed |
+```python
+class CFG:
+    DATA_PATH = "Data of biomass gasification.xlsx"
+    OUTPUT_DIR = "results_gam_comparison"
+    SHEET_PERCENT = "data of %"
+    SHEET_GY = "data of GY"
+    N_FOLDS = 5
+    RANDOM_STATE = 42
+```
 
-## References
+Change these values directly in the script when using a different file name, output directory, worksheet name, number of folds, or random seed.
 
-- Lou et al. (2012). *Intelligible Models for Classification and Regression.* KDD.
-- Lou et al. (2013). *Accurate Intelligible Models with Pairwise Interactions.* KDD.
-- Hastie & Tibshirani (1990). *Generalized Additive Models.* Chapman & Hall.
-- Agarwal et al. (2021). *Neural Additive Models.* NeurIPS.
+The current script does not use command-line arguments.
 
-## Notes
+## Running the workflow
 
-- NAM training uses 200 epochs by default; a full run can take considerable time. CPU is used when no GPU is available.
-- If a dependency is missing, the corresponding model is reported as `[SKIP]` at startup and excluded from the comparison.
-- Re-running overwrites existing files in `results_gam_comparison/`; back up prior results if needed.
+Run the complete analysis with:
+
+```bash
+python GAMs.py
+```
+
+The script automatically checks whether the packages required by each model are available. Missing model packages cause the corresponding model variants to be skipped. Install all packages listed above to reproduce the full eight-model comparison.
+
+The complete workflow includes repeated cross-validation, final model fitting, and high-resolution figure generation. Runtime depends on the processor, memory, and availability of GPU acceleration.
+
+## Monotonic constraints
+
+Directional constraints are imposed only on variable–target relationships supported by the predefined physical priors.
+
+| Variable | H₂ | CO | CO₂ | CH₄ |
+|---|---:|---:|---:|---:|
+| T | Increasing | Increasing | Decreasing | Unconstrained |
+| ER | Decreasing | Decreasing | Increasing | Decreasing |
+| Moisture | Increasing | Decreasing | Increasing | Increasing |
+| S/B | Unconstrained | Unconstrained | Unconstrained | Unconstrained |
+
+No monotonic constraints are imposed on C, H, O, Ash, bed material, or GY.
+
+For EBM-Mono and GA2M-Mono, constraints are applied directly to the corresponding main-effect terms. Pairwise interactions remain unconstrained. NAM-Mono uses post-training isotonic correction and is therefore not an end-to-end monotonic neural architecture.
+
+## PhysRate
+
+PhysRate evaluates whether the complete model follows all prescribed local response directions around each evaluated sample.
+
+For every constrained feature, the code estimates local derivatives using central finite differences over ten perturbation scales. A sample is counted as conforming only when every constrained derivative satisfies its required direction at every evaluated scale.
+
+A PhysRate of 100% means that all evaluated samples satisfy all prescribed local directional trends. It does not imply compliance with every thermodynamic, kinetic, or conservation constraint of biomass gasification.
+
+## Cross-validation and model selection
+
+The workflow uses shuffled five-fold cross-validation with a fixed random seed.
+
+For every target and model:
+
+- approximately 80% of the samples are used for training in each split;
+- continuous variables are standardized using training-set statistics only;
+- the same split is used for all compared models;
+- mean cross-validation performance is reported;
+- the split with the highest test R² is recorded as the best split.
+
+The best split is used to report prediction potential and to generate the corresponding measured-versus-predicted results.
+
+## Interpretation workflow
+
+GA2M-Mono is refitted on all available preprocessed samples for H₂, CO, CO₂, and CH₄. This full-data refit is used only for interpretation.
+
+The workflow exports:
+
+- mean absolute importance of main-effect and pairwise terms;
+- centered main-effect functions;
+- ICE curves for 50 reproducibly selected observations;
+- PDP curves averaged over all observations;
+- isolated pairwise interaction contribution surfaces;
+- rankings of retained continuous–continuous interaction terms.
+
+The pairwise surfaces exclude the corresponding main effects and other model terms. They therefore represent the additional contribution associated with the selected variable pair.
+
+## Output files
+
+All results are written to:
+
+```text
+results_gam_comparison/
+```
+
+Important outputs include:
+
+```text
+results_gam_comparison/
+├── cv_results_raw.xlsx
+├── cv_results_aggregated.xlsx
+├── comprehensive_fold_summary.xlsx
+├── manuscript_tables/
+│   ├── Table3_Predictive_Performance.xlsx
+│   ├── Table3_Predictive_Performance.csv
+│   └── README_Table3.txt
+├── manuscript_figures/
+│   ├── Fig1_feature_importance_GA2M_Mono_four_targets.*
+│   ├── Fig2_shape_functions_biomass.*
+│   ├── Fig3_shape_functions_operating.*
+│   ├── Fig4_pairwise_interactions.*
+│   ├── FigS1_predicted_vs_measured_best_split_GAMs_Mono.*
+│   ├── FigS2_ICE_PDP_biomass.*
+│   └── FigS3_ICE_PDP_operating.*
+├── manuscript_excels/
+│   └── Data corresponding to the manuscript figures
+├── H2/
+├── CO/
+├── CO2/
+├── CH4/
+└── GY/
+```
+
+Each target directory may contain:
+
+- saved models and scalers;
+- interactive prediction scripts;
+- best-split prediction data;
+- prediction scatter plots;
+- residual plots;
+- model-specific interpretation files.
+
+Most figures are saved in PNG, PDF, and SVG formats. Numerical data underlying the principal figures are also exported to Excel.
+
+## Using a saved prediction model
+
+The workflow generates model-specific scripts in:
+
+```text
+results_gam_comparison/<TARGET>/prediction_scripts/
+```
+
+For example:
+
+```bash
+python results_gam_comparison/H2/prediction_scripts/predict_GA2M_Mono_H2.py
+```
+
+The script requests T, ER, S/B, C, H, O, Ash, Moisture, and bed material, then loads the corresponding saved model and scaler to generate a prediction.
+
+Temperature must be entered in K, and bed material must be an integer from 1 to 4.
+
+## Reproducibility notes
+
+- The global random seed is fixed at `42`.
+- Cross-validation uses shuffled `KFold`.
+- The same data splits are used for all models of a given target.
+- Training-set statistics are used for scaling within each split.
+- ICE samples are selected with a local random generator using the same fixed seed.
+- Available model variants depend on the installed packages and their versions.
+
+Small numerical differences may occur across operating systems, package versions, processor architectures, and CPU/GPU execution.
+
+## Method references
+
+- Hastie, T., and Tibshirani, R. *Generalized Additive Models*. Chapman & Hall, 1990.
+- Lou, Y., Caruana, R., and Gehrke, J. “Intelligible Models for Classification and Regression.” KDD, 2012.
+- Lou, Y., Caruana, R., Gehrke, J., and Hooker, G. “Accurate Intelligible Models with Pairwise Interactions.” KDD, 2013.
+- Agarwal, R. et al. “Neural Additive Models: Interpretable Machine Learning with Neural Nets.” NeurIPS, 2021.
+
+## Citation
+
+When using this code, please cite the associated manuscript:
+
+> **Physically constrained generalized additive models for interpretable biomass gasification prediction**
+
+Full bibliographic information can be added here after publication.
+
+## Contact
+
+For questions about the implementation or reproduction of the results, please contact the corresponding authors listed in the associated manuscript.
