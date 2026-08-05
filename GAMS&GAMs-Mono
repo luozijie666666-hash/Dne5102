@@ -115,6 +115,14 @@ class CFG:
     N_FOLDS = 5
     RANDOM_STATE = 42
 
+    # Independent bootstrap robustness analysis for the final full-data
+    # GA2M-Mono interpretations. Set to False to skip this additional stage.
+    RUN_INTERPRETABILITY_ROBUSTNESS = True
+    ROBUSTNESS_N_BOOTSTRAPS = 100
+    ROBUSTNESS_GRID_POINTS = 80
+    ROBUSTNESS_GRID_QUANTILES = (0.05, 0.95)
+    ROBUSTNESS_TOP_K = 5
+
 
 CONTINUOUS_COLS = ["T", "ER", "Steam/Biomass", "C", "H", "O", "Ash", "Moisture"]
 BED_COL = CFG.CAT_FEATURE
@@ -377,11 +385,14 @@ class GA2MWrapper(GAMModelWrapper):
 
 
 class NAMWrapper(GAMModelWrapper):
-    def __init__(self, monotonic: bool = False, hidden_units: List[int] = None, epochs: int = 200, lr: float = 0.01):
+    def __init__(self, monotonic: bool = False, hidden_units: List[int] = None,
+                 epochs: int = 200, lr: float = 0.01,
+                 random_state: int = CFG.RANDOM_STATE):
         super().__init__(name="NAM_Mono" if monotonic else "NAM", monotonic=monotonic)
         self.hidden_units = hidden_units or [64, 32]
         self.epochs = epochs
         self.lr = lr
+        self.random_state = int(random_state)
         self._feature_nns = None
         self._bias = None
         self._device = None
@@ -390,17 +401,49 @@ class NAMWrapper(GAMModelWrapper):
         self._isotonic_models = None
     
     def _build_model(self, target: str = None) -> Any:
-        if self.monotonic and target:
-            self._constraints = get_constraints_vector(target)
+        self._constraints = (
+            get_constraints_vector(target)
+            if self.monotonic and target
+            else [0] * len(FEATURE_COLUMNS)
+        )
         return self
+
+    def _reset_training_seed(self, torch_module) -> None:
+        """Reset all RNGs so paired NAM/NAM-Mono fits share initialization."""
+        random.seed(self.random_state)
+        np.random.seed(self.random_state)
+        torch_module.manual_seed(self.random_state)
+        if torch_module.cuda.is_available():
+            torch_module.cuda.manual_seed_all(self.random_state)
+            # Required by some CUDA versions for deterministic matrix products.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        try:
+            torch_module.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            # Compatibility with older PyTorch releases without warn_only.
+            try:
+                torch_module.use_deterministic_algorithms(True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        if hasattr(torch_module.backends, "cudnn"):
+            torch_module.backends.cudnn.deterministic = True
+            torch_module.backends.cudnn.benchmark = False
     
     def fit(self, X: np.ndarray, y: np.ndarray, target: str = None) -> 'NAMWrapper':
         import torch
         import torch.nn as nn
+
         self.target = target
         start = time.time()
-        if self.monotonic and target:
-            self._constraints = get_constraints_vector(target)
+        self._reset_training_seed(torch)
+        self._constraints = (
+            get_constraints_vector(target)
+            if self.monotonic and target
+            else [0] * len(FEATURE_COLUMNS)
+        )
+        self._isotonic_models = None
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._X_train = X.copy()
         X_t = torch.tensor(X, dtype=torch.float32, device=self._device)
@@ -418,16 +461,22 @@ class NAMWrapper(GAMModelWrapper):
         self._bias = nn.Parameter(torch.zeros(1, device=self._device))
         params = list(self._feature_nns.parameters()) + [self._bias]
         optimizer = torch.optim.Adam(params, lr=self.lr)
+        loss_fn = nn.MSELoss()
         for _ in range(self.epochs):
             optimizer.zero_grad()
             pred = self._bias.clone()
             for i, nn_i in enumerate(self._feature_nns):
                 pred = pred + nn_i(X_t[:, i:i+1])
-            loss = nn.MSELoss()(pred, y_t)
+            loss = loss_fn(pred, y_t)
             loss.backward()
             optimizer.step()
-        if self.monotonic and self._constraints:
+
+        has_active_constraints = any(
+            value != 0 for value in self._constraints[:N_CONTINUOUS]
+        )
+        if self.monotonic and has_active_constraints:
             self._build_isotonic_models(X)
+
         self.model = self
         self.fit_time = time.time() - start
         self.is_fitted = True
@@ -471,7 +520,13 @@ class NAMWrapper(GAMModelWrapper):
         return pred
     
     def clone(self) -> 'NAMWrapper':
-        return NAMWrapper(monotonic=self.monotonic, hidden_units=self.hidden_units, epochs=self.epochs, lr=self.lr)
+        return NAMWrapper(
+            monotonic=self.monotonic,
+            hidden_units=list(self.hidden_units),
+            epochs=self.epochs,
+            lr=self.lr,
+            random_state=self.random_state,
+        )
 
 
 def get_available_models(include_monotonic: bool = True) -> List[GAMModelWrapper]:
@@ -2858,6 +2913,723 @@ def _plot_figS1_best_fold(predictions: Dict[str, Dict[str, Dict[str, Any]]],
         index=False,
     )
 
+
+
+def _safe_correlation(x: np.ndarray, y: np.ndarray, method: str = "pearson") -> float:
+    """Return a finite correlation when possible, otherwise NaN."""
+    from scipy.stats import pearsonr, spearmanr
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if x.size < 3 or np.nanstd(x) <= 1e-12 or np.nanstd(y) <= 1e-12:
+        return np.nan
+    if method == "spearman":
+        result = spearmanr(x, y)
+        return float(getattr(result, "correlation", result[0]))
+    result = pearsonr(x, y)
+    return float(getattr(result, "statistic", result[0]))
+
+
+def _main_effect_importance_vector(model: GAMModelWrapper,
+                                   X_reference: np.ndarray) -> pd.DataFrame:
+    """Return a complete, comparable main-effect importance vector."""
+    table = _get_term_importance_table(model, X_reference)
+    main = table[table["TermType"] == "Main effect"].copy()
+    importance_map = {
+        tuple(row["FeatureIndices"])[0]: float(row["Importance"])
+        for _, row in main.iterrows()
+        if isinstance(row["FeatureIndices"], tuple) and len(row["FeatureIndices"]) == 1
+    }
+    total_importance = float(table["Importance"].sum())
+    main_total = float(sum(importance_map.values()))
+
+    rows = []
+    for feature_idx, feature in enumerate(FEATURE_COLUMNS):
+        raw = float(importance_map.get(feature_idx, 0.0))
+        rows.append({
+            "FeatureIndex": feature_idx,
+            "Feature": feature.replace("Steam/Biomass", "S/B"),
+            "RawImportance": raw,
+            "ShareOfAllTerms": raw / total_importance if total_importance > 0 else np.nan,
+            "ShareWithinMainEffects": raw / main_total if main_total > 0 else np.nan,
+        })
+    result = pd.DataFrame(rows)
+    result["RankWithinMainEffects"] = (
+        result["RawImportance"].rank(method="average", ascending=False)
+    )
+    return result
+
+
+def _continuous_pair_importance_table(model: GAMModelWrapper,
+                                      X_reference: np.ndarray) -> pd.DataFrame:
+    """Return all retained continuous-continuous pairwise terms."""
+    table = _get_term_importance_table(model, X_reference)
+    total_importance = float(table["Importance"].sum())
+    rows = []
+    for _, row in table.iterrows():
+        term = row["FeatureIndices"]
+        if not (isinstance(term, tuple) and len(term) == 2):
+            continue
+        pair = tuple(sorted(int(v) for v in term))
+        if not all(idx < N_CONTINUOUS for idx in pair):
+            continue
+        rows.append({
+            "PairKey": f"{pair[0]}-{pair[1]}",
+            "Pair": _format_term_name(pair),
+            "FeatureI": pair[0],
+            "FeatureJ": pair[1],
+            "RawImportance": float(row["Importance"]),
+            "ShareOfAllTerms": (
+                float(row["Importance"]) / total_importance
+                if total_importance > 0 else np.nan
+            ),
+        })
+    if not rows:
+        return pd.DataFrame(columns=[
+            "PairKey", "Pair", "FeatureI", "FeatureJ",
+            "RawImportance", "ShareOfAllTerms", "Rank",
+        ])
+    result = pd.DataFrame(rows).sort_values("RawImportance", ascending=False)
+    result["Rank"] = np.arange(1, len(result) + 1)
+    return result.reset_index(drop=True)
+
+
+def _common_raw_grid(df_target: pd.DataFrame, feature_idx: int,
+                     n_grid: int, quantiles: Tuple[float, float]) -> np.ndarray:
+    """Build a common raw-scale grid from the central observed range."""
+    values = df_target[CONTINUOUS_COLS[feature_idx]].astype(float).to_numpy()
+    lo, hi = np.quantile(values, quantiles)
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        raise ValueError(f"Non-finite grid limits for {CONTINUOUS_COLS[feature_idx]}")
+    if hi <= lo:
+        lo, hi = float(np.min(values)), float(np.max(values))
+    if hi <= lo:
+        hi = lo + 1e-9
+    return np.linspace(float(lo), float(hi), int(n_grid))
+
+
+def _evaluate_main_effect_on_raw_grid(model: GAMModelWrapper,
+                                      scaler: StandardScaler,
+                                      reference_df: pd.DataFrame,
+                                      feature_idx: int,
+                                      raw_grid: np.ndarray) -> np.ndarray:
+    """Evaluate one isolated EBM/GA2M main-effect term on a common raw grid."""
+    X_reference = transform_features(reference_df, scaler)
+    ebm = _unwrap_ebm(model)
+    term_features = _get_ebm_term_features(ebm)
+    term_map = {
+        term[0]: term_idx
+        for term_idx, term in enumerate(term_features)
+        if len(term) == 1
+    }
+    if feature_idx not in term_map:
+        return np.zeros_like(raw_grid, dtype=float)
+
+    term_idx = term_map[feature_idx]
+    observed_terms = _eval_ebm_terms(ebm, X_reference)
+    baseline = float(np.mean(observed_terms[:, term_idx]))
+
+    scaled_grid = (
+        (np.asarray(raw_grid, dtype=float) - scaler.mean_[feature_idx])
+        / scaler.scale_[feature_idx]
+    )
+    X_batch = np.repeat(
+        X_reference[np.newaxis, :, :], len(scaled_grid), axis=0
+    )
+    X_batch[:, :, feature_idx] = scaled_grid[:, np.newaxis]
+    evaluated = _eval_ebm_terms(
+        ebm, X_batch.reshape(-1, X_reference.shape[1])
+    )[:, term_idx]
+    curve = evaluated.reshape(len(scaled_grid), X_reference.shape[0]).mean(axis=1)
+    return np.asarray(curve - baseline, dtype=float)
+
+
+def _curve_stability_metrics(full_curve: np.ndarray,
+                             bootstrap_curve: np.ndarray) -> Dict[str, float]:
+    """Compare one bootstrap main-effect curve with the final full-data curve."""
+    full_curve = np.asarray(full_curve, dtype=float)
+    bootstrap_curve = np.asarray(bootstrap_curve, dtype=float)
+    scale = max(float(np.ptp(full_curve)), float(np.std(full_curve)), 1e-12)
+    nrmse = float(np.sqrt(np.mean((bootstrap_curve - full_curve) ** 2)) / scale)
+
+    full_diff = np.diff(full_curve)
+    boot_diff = np.diff(bootstrap_curve)
+    tolerance = max(float(np.ptp(full_curve)) * 1e-4, 1e-10)
+    informative = np.abs(full_diff) > tolerance
+    if np.any(informative):
+        direction_agreement = float(np.mean(
+            np.sign(full_diff[informative]) == np.sign(boot_diff[informative])
+        ))
+    else:
+        direction_agreement = np.nan
+
+    return {
+        "PearsonCorrelation": _safe_correlation(full_curve, bootstrap_curve, "pearson"),
+        "SpearmanCorrelation": _safe_correlation(full_curve, bootstrap_curve, "spearman"),
+        "NormalizedRMSE": nrmse,
+        "DirectionAgreement": direction_agreement,
+    }
+
+
+def _save_robustness_figure(fig, directory: str, stem: str) -> None:
+    ensure_dir(directory)
+    fig.savefig(os.path.join(directory, stem + ".png"), dpi=600,
+                bbox_inches="tight", facecolor="white")
+    fig.savefig(os.path.join(directory, stem + ".pdf"),
+                bbox_inches="tight", facecolor="white")
+    fig.savefig(os.path.join(directory, stem + ".svg"),
+                bbox_inches="tight", facecolor="white")
+
+
+def _plot_bootstrap_importance_stability(full_importance: pd.DataFrame,
+                                         importance_summary: pd.DataFrame,
+                                         target: str,
+                                         target_dir: str) -> None:
+    """Plot final-model importance against bootstrap uncertainty intervals."""
+    plot_df = importance_summary.merge(
+        full_importance[["Feature", "ShareWithinMainEffects"]].rename(
+            columns={"ShareWithinMainEffects": "FullDataShare"}
+        ), on="Feature", how="left"
+    ).sort_values("FullDataShare", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.2))
+    y = np.arange(len(plot_df))
+    lower = plot_df["Median"] - plot_df["CI2.5"]
+    upper = plot_df["CI97.5"] - plot_df["Median"]
+    ax.errorbar(
+        plot_df["Median"], y,
+        xerr=np.vstack([lower.clip(lower=0), upper.clip(lower=0)]),
+        fmt="o", markersize=4.2, capsize=2.4, linewidth=0.9,
+        label="Bootstrap median and 95% interval",
+    )
+    ax.scatter(
+        plot_df["FullDataShare"], y, marker="s", s=24,
+        label="Final full-data model", zorder=3,
+    )
+    ax.set_yticks(y)
+    ax.set_yticklabels(plot_df["Feature"], fontsize=8.2)
+    ax.set_xlabel("Normalized main-effect importance", fontsize=9)
+    ax.set_title(f"{target}: bootstrap stability of main-effect importance",
+                 fontsize=10, fontweight="bold")
+    ax.set_xlim(left=0)
+    ax.grid(axis="x", linestyle="--", linewidth=0.4, alpha=0.3)
+    ax.grid(axis="y", visible=False)
+    ax.legend(frameon=False, fontsize=8, loc="lower right")
+    fig.tight_layout()
+    _save_robustness_figure(fig, target_dir, "main_effect_importance_stability")
+    plt.close(fig)
+
+
+def _plot_bootstrap_curve_stability(curve_summary: pd.DataFrame,
+                                    target: str,
+                                    target_dir: str) -> None:
+    """Plot full-data main effects with bootstrap 95% uncertainty bands."""
+    fig, axes = plt.subplots(2, 4, figsize=(12.8, 6.7), squeeze=False)
+    axes = axes.flatten()
+    for feature_idx, feature in enumerate(CONTINUOUS_COLS):
+        ax = axes[feature_idx]
+        sub = curve_summary[
+            curve_summary["Feature"] == feature
+        ].sort_values("X")
+        ax.fill_between(
+            sub["X"].to_numpy(), sub["CI2.5"].to_numpy(),
+            sub["CI97.5"].to_numpy(), alpha=0.22,
+            label="Bootstrap 95% interval",
+        )
+        ax.plot(sub["X"], sub["Median"], linewidth=1.35,
+                label="Bootstrap median")
+        ax.plot(sub["X"], sub["FullDataCurve"], linewidth=1.65,
+                linestyle="--", label="Final full-data model")
+        ax.axhline(0, color="black", linestyle=":", linewidth=0.65, alpha=0.65)
+        ax.set_xlabel(FEATURE_UNITS.get(feature, feature), fontsize=8.2)
+        ax.set_ylabel(_target_contribution_label(target, "Main-effect contribution"),
+                      fontsize=7.8)
+        ax.set_title(
+            f"({chr(97 + feature_idx)}) {feature.replace('Steam/Biomass', 'S/B')}",
+            loc="left", fontsize=9.0, fontweight="bold"
+        )
+        ax.tick_params(which="both", direction="in", top=True, right=True,
+                       labelsize=7.5)
+        ax.grid(True, linestyle="--", linewidth=0.35, alpha=0.25)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3,
+               bbox_to_anchor=(0.5, 0.995), frameon=False, fontsize=8.2)
+    fig.tight_layout(rect=[0.01, 0.01, 0.995, 0.955], h_pad=1.2, w_pad=1.1)
+    _save_robustness_figure(fig, target_dir, "main_effect_curve_stability")
+    plt.close(fig)
+
+
+def _plot_pairwise_selection_frequency(pair_summary: pd.DataFrame,
+                                       target: str,
+                                       target_dir: str,
+                                       top_n: int = 12) -> None:
+    """Plot the most frequently selected continuous pairwise terms."""
+    if pair_summary.empty:
+        return
+    plot_df = pair_summary.sort_values(
+        ["SelectionFrequency", "MeanShareAllBootstraps"], ascending=False
+    ).head(top_n).sort_values("SelectionFrequency", ascending=True)
+    fig, ax = plt.subplots(figsize=(6.5, max(3.8, 0.32 * len(plot_df) + 1.4)))
+    y = np.arange(len(plot_df))
+    ax.barh(y, plot_df["SelectionFrequency"] * 100.0,
+            edgecolor="black", linewidth=0.35, alpha=0.80)
+    ax.set_yticks(y)
+    ax.set_yticklabels(plot_df["Pair"], fontsize=8.0)
+    ax.set_xlabel("Selection frequency [%]", fontsize=9)
+    ax.set_xlim(0, 100)
+    ax.set_title(f"{target}: bootstrap selection frequency of pairwise terms",
+                 fontsize=10, fontweight="bold")
+    ax.grid(axis="x", linestyle="--", linewidth=0.4, alpha=0.3)
+    ax.grid(axis="y", visible=False)
+    fig.tight_layout()
+    _save_robustness_figure(fig, target_dir, "pairwise_selection_frequency")
+    plt.close(fig)
+
+
+def run_interpretability_robustness_analysis(
+        contexts: Dict[str, Dict[str, Any]],
+        model_template: GAMModelWrapper,
+        output_dir: str) -> None:
+    """
+    Independently assess the robustness of final full-data GA2M-Mono explanations.
+
+    The full-data model remains the single model used for the manuscript's term
+    importance, main-effect, ICE/PDP, and pairwise-surface interpretation. This
+    bootstrap stage does not combine explanations from different models into one
+    synthetic explanation. It only quantifies sensitivity to sample composition
+    through common main-effect rankings, common raw-scale response grids, and
+    interaction selection frequencies.
+    """
+    from scipy.stats import spearmanr
+
+    robustness_root = os.path.join(output_dir, "interpretability_robustness")
+    if os.path.exists(robustness_root):
+        shutil.rmtree(robustness_root)
+    ensure_dir(robustness_root)
+
+    n_boot = int(CFG.ROBUSTNESS_N_BOOTSTRAPS)
+    if n_boot < 10:
+        raise ValueError("ROBUSTNESS_N_BOOTSTRAPS should be at least 10.")
+    q_low, q_high = CFG.ROBUSTNESS_GRID_QUANTILES
+    if not (0 <= q_low < q_high <= 1):
+        raise ValueError("ROBUSTNESS_GRID_QUANTILES must satisfy 0 <= low < high <= 1.")
+
+    overall_rows = []
+    all_run_rows = []
+    all_importance_summaries = []
+    all_curve_metric_summaries = []
+    all_pair_summaries = []
+
+    print("\n[8] Running independent bootstrap robustness analysis...")
+    print(f"  Bootstrap refits per target: {n_boot}")
+
+    for target in INTERPRETATION_TARGETS:
+        print(f"\n  Robustness target: {target}")
+        context = contexts[target]
+        full_model = context["model"]
+        full_scaler = context["scaler"]
+        df_target = context["data"].reset_index(drop=True).copy()
+        y_full = df_target[target].to_numpy(dtype=float)
+        X_full_reference = transform_features(df_target, full_scaler)
+        n_samples = len(df_target)
+        target_dir = os.path.join(robustness_root, target)
+        ensure_dir(target_dir)
+
+        full_importance = _main_effect_importance_vector(
+            full_model, X_full_reference
+        )
+        full_pair_table = _continuous_pair_importance_table(
+            full_model, X_full_reference
+        )
+        full_rank = full_importance.set_index("Feature")["RankWithinMainEffects"]
+        full_top = set(
+            full_importance.nsmallest(CFG.ROBUSTNESS_TOP_K,
+                                      "RankWithinMainEffects")["Feature"]
+        )
+
+        grids = {
+            feature_idx: _common_raw_grid(
+                df_target, feature_idx, CFG.ROBUSTNESS_GRID_POINTS,
+                CFG.ROBUSTNESS_GRID_QUANTILES
+            )
+            for feature_idx in range(N_CONTINUOUS)
+        }
+        full_curves = {
+            feature_idx: _evaluate_main_effect_on_raw_grid(
+                full_model, full_scaler, df_target, feature_idx,
+                grids[feature_idx]
+            )
+            for feature_idx in range(N_CONTINUOUS)
+        }
+
+        rng = np.random.default_rng(
+            CFG.RANDOM_STATE + 10000 + 1000 * INTERPRETATION_TARGETS.index(target)
+        )
+        run_rows = []
+        importance_rows = []
+        curve_rows = []
+        curve_metric_rows = []
+        pair_rows = []
+        error_rows = []
+
+        for boot_idx in range(n_boot):
+            replicate = boot_idx + 1
+            sample_idx = rng.integers(0, n_samples, size=n_samples)
+            unique_idx = np.unique(sample_idx)
+            oob_idx = np.setdiff1d(np.arange(n_samples), unique_idx,
+                                   assume_unique=False)
+            df_boot = df_target.iloc[sample_idx].reset_index(drop=True)
+
+            print(f"    Bootstrap {replicate:03d}/{n_boot}", end="")
+            try:
+                scaler_boot = fit_scaler(df_boot)
+                X_boot = transform_features(df_boot, scaler_boot)
+                y_boot = df_boot[target].to_numpy(dtype=float)
+                model_boot = model_template.clone()
+                model_boot.fit(X_boot, y_boot, target=target)
+
+                X_reference_boot_scale = transform_features(df_target, scaler_boot)
+                y_reference_pred = model_boot.predict(X_reference_boot_scale)
+                reference_r2 = float(r2_score(y_full, y_reference_pred))
+                inbag_r2 = float(r2_score(y_boot, model_boot.predict(X_boot)))
+                if len(oob_idx) >= 3:
+                    X_oob = transform_features(df_target.iloc[oob_idx], scaler_boot)
+                    oob_r2 = float(r2_score(
+                        df_target.iloc[oob_idx][target].to_numpy(dtype=float),
+                        model_boot.predict(X_oob)
+                    ))
+                else:
+                    oob_r2 = np.nan
+
+                importance = _main_effect_importance_vector(
+                    model_boot, X_reference_boot_scale
+                )
+                importance["Target"] = target
+                importance["Bootstrap"] = replicate
+                importance_rows.extend(importance.to_dict("records"))
+
+                boot_rank = importance.set_index("Feature")["RankWithinMainEffects"]
+                common_features = list(FEATURE_COLUMNS)
+                common_display = [v.replace("Steam/Biomass", "S/B")
+                                  for v in common_features]
+                ranking_spearman = float(spearmanr(
+                    [full_rank.loc[v] for v in common_display],
+                    [boot_rank.loc[v] for v in common_display]
+                ).correlation)
+                boot_top = set(
+                    importance.nsmallest(CFG.ROBUSTNESS_TOP_K,
+                                         "RankWithinMainEffects")["Feature"]
+                )
+                top_overlap = len(full_top & boot_top) / max(len(full_top), 1)
+
+                replicate_curve_correlations = []
+                for feature_idx, feature in enumerate(CONTINUOUS_COLS):
+                    curve = _evaluate_main_effect_on_raw_grid(
+                        model_boot, scaler_boot, df_target, feature_idx,
+                        grids[feature_idx]
+                    )
+                    metrics = _curve_stability_metrics(
+                        full_curves[feature_idx], curve
+                    )
+                    if np.isfinite(metrics["PearsonCorrelation"]):
+                        replicate_curve_correlations.append(
+                            metrics["PearsonCorrelation"]
+                        )
+                    curve_metric_rows.append({
+                        "Target": target,
+                        "Bootstrap": replicate,
+                        "Feature": feature,
+                        **metrics,
+                    })
+                    for x_value, curve_value, full_value in zip(
+                            grids[feature_idx], curve,
+                            full_curves[feature_idx]):
+                        curve_rows.append({
+                            "Target": target,
+                            "Bootstrap": replicate,
+                            "Feature": feature,
+                            "X": float(x_value),
+                            "BootstrapCurve": float(curve_value),
+                            "FullDataCurve": float(full_value),
+                        })
+
+                pair_table = _continuous_pair_importance_table(
+                    model_boot, X_reference_boot_scale
+                )
+                for _, pair_row in pair_table.iterrows():
+                    pair_rows.append({
+                        "Target": target,
+                        "Bootstrap": replicate,
+                        "PairKey": pair_row["PairKey"],
+                        "Pair": pair_row["Pair"],
+                        "RawImportance": float(pair_row["RawImportance"]),
+                        "ShareOfAllTerms": float(pair_row["ShareOfAllTerms"]),
+                        "Rank": int(pair_row["Rank"]),
+                    })
+
+                run_row = {
+                    "Target": target,
+                    "Bootstrap": replicate,
+                    "UniqueSamples": int(len(unique_idx)),
+                    "UniqueFraction": float(len(unique_idx) / n_samples),
+                    "OOBSamples": int(len(oob_idx)),
+                    "FitTime": float(model_boot.fit_time),
+                    "InBag_R2": inbag_r2,
+                    "FullReference_R2": reference_r2,
+                    "OOB_R2": oob_r2,
+                    "MainEffectRankSpearman": ranking_spearman,
+                    "TopKOverlap": float(top_overlap),
+                    "MeanMainEffectCurvePearson": (
+                        float(np.mean(replicate_curve_correlations))
+                        if replicate_curve_correlations else np.nan
+                    ),
+                    "Status": "OK",
+                }
+                run_rows.append(run_row)
+                print(f"  OK  rank rho={ranking_spearman:.3f}")
+            except Exception as exc:
+                error_rows.append({
+                    "Target": target,
+                    "Bootstrap": replicate,
+                    "ErrorType": type(exc).__name__,
+                    "Error": str(exc),
+                })
+                run_rows.append({
+                    "Target": target,
+                    "Bootstrap": replicate,
+                    "UniqueSamples": int(len(unique_idx)),
+                    "UniqueFraction": float(len(unique_idx) / n_samples),
+                    "OOBSamples": int(len(oob_idx)),
+                    "Status": "FAILED",
+                })
+                print(f"  FAILED: {type(exc).__name__}: {exc}")
+
+        run_df = pd.DataFrame(run_rows)
+        successful = run_df[run_df["Status"] == "OK"].copy()
+        if len(successful) < max(10, int(0.8 * n_boot)):
+            raise RuntimeError(
+                f"Only {len(successful)}/{n_boot} bootstrap fits succeeded for {target}."
+            )
+        importance_df = pd.DataFrame(importance_rows)
+        curve_df = pd.DataFrame(curve_rows)
+        curve_metric_df = pd.DataFrame(curve_metric_rows)
+        pair_df = pd.DataFrame(pair_rows)
+        error_df = pd.DataFrame(error_rows)
+
+        importance_summary = (
+            importance_df.groupby("Feature")["ShareWithinMainEffects"]
+            .agg(
+                Mean="mean", SD="std", Median="median",
+                CI2_5=lambda x: x.quantile(0.025),
+                CI97_5=lambda x: x.quantile(0.975),
+            )
+            .reset_index()
+            .rename(columns={"CI2_5": "CI2.5", "CI97_5": "CI97.5"})
+        )
+        importance_summary = importance_summary.merge(
+            full_importance[[
+                "Feature", "RawImportance", "ShareOfAllTerms",
+                "ShareWithinMainEffects", "RankWithinMainEffects",
+            ]].rename(columns={
+                "RawImportance": "Full_RawImportance",
+                "ShareOfAllTerms": "Full_ShareOfAllTerms",
+                "ShareWithinMainEffects": "Full_ShareWithinMainEffects",
+                "RankWithinMainEffects": "Full_RankWithinMainEffects",
+            }), on="Feature", how="left"
+        )
+
+        curve_summary = (
+            curve_df.groupby(["Feature", "X"])
+            .agg(
+                FullDataCurve=("FullDataCurve", "first"),
+                Mean=("BootstrapCurve", "mean"),
+                SD=("BootstrapCurve", "std"),
+                Median=("BootstrapCurve", "median"),
+                CI2_5=("BootstrapCurve", lambda x: x.quantile(0.025)),
+                CI97_5=("BootstrapCurve", lambda x: x.quantile(0.975)),
+            )
+            .reset_index()
+            .rename(columns={"CI2_5": "CI2.5", "CI97_5": "CI97.5"})
+        )
+        curve_metric_summary = (
+            curve_metric_df.groupby("Feature")
+            .agg({
+                "PearsonCorrelation": ["mean", "std", "median"],
+                "SpearmanCorrelation": ["mean", "std", "median"],
+                "NormalizedRMSE": ["mean", "std", "median"],
+                "DirectionAgreement": ["mean", "std", "median"],
+            })
+        )
+        curve_metric_summary.columns = [
+            "_".join(col).strip() for col in curve_metric_summary.columns
+        ]
+        curve_metric_summary = curve_metric_summary.reset_index()
+
+        all_pair_keys = {
+            f"{i}-{j}": (i, j)
+            for i in range(N_CONTINUOUS)
+            for j in range(i + 1, N_CONTINUOUS)
+        }
+        pair_summary_rows = []
+        full_pair_map = (
+            full_pair_table.set_index("PairKey").to_dict("index")
+            if not full_pair_table.empty else {}
+        )
+        for pair_key, (feature_i, feature_j) in all_pair_keys.items():
+            if pair_df.empty:
+                selected = pd.DataFrame()
+            else:
+                selected = pair_df[pair_df["PairKey"] == pair_key]
+            full_info = full_pair_map.get(pair_key, {})
+            pair_summary_rows.append({
+                "PairKey": pair_key,
+                "Pair": _format_term_name((feature_i, feature_j)),
+                "SelectionCount": int(selected["Bootstrap"].nunique())
+                    if not selected.empty else 0,
+                "SelectionFrequency": (
+                    float(selected["Bootstrap"].nunique() / len(successful))
+                    if len(successful) else np.nan
+                ),
+                "MeanShareWhenSelected": (
+                    float(selected["ShareOfAllTerms"].mean())
+                    if not selected.empty else 0.0
+                ),
+                "MeanShareAllBootstraps": (
+                    float(selected["ShareOfAllTerms"].sum() / len(successful))
+                    if len(successful) else np.nan
+                ),
+                "FullDataSelected": pair_key in full_pair_map,
+                "FullDataShare": float(full_info.get("ShareOfAllTerms", 0.0)),
+                "FullDataRank": full_info.get("Rank", np.nan),
+            })
+        pair_summary = pd.DataFrame(pair_summary_rows).sort_values(
+            ["SelectionFrequency", "MeanShareAllBootstraps"], ascending=False
+        )
+
+        _plot_bootstrap_importance_stability(
+            full_importance, importance_summary, target, target_dir
+        )
+        _plot_bootstrap_curve_stability(curve_summary, target, target_dir)
+        _plot_pairwise_selection_frequency(pair_summary, target, target_dir)
+
+        with pd.ExcelWriter(os.path.join(target_dir, "robustness_results.xlsx")) as writer:
+            run_df.to_excel(writer, sheet_name="Bootstrap_runs", index=False)
+            full_importance.to_excel(writer, sheet_name="Full_main_importance", index=False)
+            importance_df.to_excel(writer, sheet_name="Bootstrap_importance_raw", index=False)
+            importance_summary.to_excel(writer, sheet_name="Importance_summary", index=False)
+            curve_metric_df.to_excel(writer, sheet_name="Curve_metrics_raw", index=False)
+            curve_metric_summary.to_excel(writer, sheet_name="Curve_metrics_summary", index=False)
+            curve_df.to_excel(writer, sheet_name="Bootstrap_curves_raw", index=False)
+            curve_summary.to_excel(writer, sheet_name="Curve_uncertainty", index=False)
+            full_pair_table.to_excel(writer, sheet_name="Full_pair_ranking", index=False)
+            pair_df.to_excel(writer, sheet_name="Bootstrap_pairs_raw", index=False)
+            pair_summary.to_excel(writer, sheet_name="Pair_selection_summary", index=False)
+            if not error_df.empty:
+                error_df.to_excel(writer, sheet_name="Errors", index=False)
+
+        successful.to_csv(
+            os.path.join(target_dir, "bootstrap_run_summary.csv"),
+            index=False, encoding="utf-8-sig"
+        )
+        importance_summary.to_csv(
+            os.path.join(target_dir, "main_effect_importance_summary.csv"),
+            index=False, encoding="utf-8-sig"
+        )
+        curve_metric_summary.to_csv(
+            os.path.join(target_dir, "main_effect_curve_metrics.csv"),
+            index=False, encoding="utf-8-sig"
+        )
+        pair_summary.to_csv(
+            os.path.join(target_dir, "pairwise_selection_frequency.csv"),
+            index=False, encoding="utf-8-sig"
+        )
+
+        target_overall = {
+            "Target": target,
+            "RequestedBootstraps": n_boot,
+            "SuccessfulBootstraps": int(len(successful)),
+            "MeanMainEffectRankSpearman": float(successful["MainEffectRankSpearman"].mean()),
+            "MedianMainEffectRankSpearman": float(successful["MainEffectRankSpearman"].median()),
+            "MeanTopKOverlap": float(successful["TopKOverlap"].mean()),
+            "MeanMainEffectCurvePearson": float(successful["MeanMainEffectCurvePearson"].mean()),
+            "MedianOOB_R2": float(successful["OOB_R2"].median()),
+            "MedianFullReference_R2": float(successful["FullReference_R2"].median()),
+        }
+        overall_rows.append(target_overall)
+        all_run_rows.extend(run_df.to_dict("records"))
+        temp = importance_summary.copy(); temp.insert(0, "Target", target)
+        all_importance_summaries.append(temp)
+        temp = curve_metric_summary.copy(); temp.insert(0, "Target", target)
+        all_curve_metric_summaries.append(temp)
+        temp = pair_summary.copy(); temp.insert(0, "Target", target)
+        all_pair_summaries.append(temp)
+
+        print(
+            f"    Completed: {len(successful)}/{n_boot} successful; "
+            f"mean rank rho={target_overall['MeanMainEffectRankSpearman']:.3f}; "
+            f"mean top-{CFG.ROBUSTNESS_TOP_K} overlap={target_overall['MeanTopKOverlap']:.3f}"
+        )
+
+    overall_df = pd.DataFrame(overall_rows)
+    with pd.ExcelWriter(os.path.join(robustness_root, "robustness_summary.xlsx")) as writer:
+        overall_df.to_excel(writer, sheet_name="Target_summary", index=False)
+        pd.DataFrame(all_run_rows).to_excel(writer, sheet_name="All_bootstrap_runs", index=False)
+        pd.concat(all_importance_summaries, ignore_index=True).to_excel(
+            writer, sheet_name="Importance_summary", index=False
+        )
+        pd.concat(all_curve_metric_summaries, ignore_index=True).to_excel(
+            writer, sheet_name="Curve_stability", index=False
+        )
+        pd.concat(all_pair_summaries, ignore_index=True).to_excel(
+            writer, sheet_name="Pair_selection", index=False
+        )
+
+    readme_path = os.path.join(
+        robustness_root, "README_interpretability_robustness.txt"
+    )
+    with open(readme_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "Independent bootstrap robustness analysis of GA2M-Mono interpretations\n"
+            "=======================================================================\n\n"
+            f"Bootstrap refits per target: {n_boot}\n"
+            f"Random seed: {CFG.RANDOM_STATE}\n"
+            f"Main-effect grid: {CFG.ROBUSTNESS_GRID_POINTS} points over the "
+            f"{100*q_low:.1f}th-{100*q_high:.1f}th percentiles of each input.\n\n"
+            "Purpose\n"
+            "-------\n"
+            "The manuscript's primary interpretability results remain those from one "
+            "GA2M-Mono model refitted on all available samples for each target. Term "
+            "importance, main-effect functions, ICE/PDP curves, and pairwise surfaces "
+            "therefore remain internally consistent components of the same fitted model.\n\n"
+            "This folder contains an independent sensitivity analysis. Bootstrap models "
+            "are not averaged into a synthetic interpretation. They are used only to "
+            "quantify: (1) stability of the common main-effect ranking, (2) uncertainty "
+            "of continuous main-effect functions on common raw-scale grids, and "
+            "(3) selection frequency of continuous pairwise interactions.\n\n"
+            "Interpretation limits\n"
+            "---------------------\n"
+            "The reported quantities describe model-specific associations and response "
+            "structures. They are not model-independent ground-truth feature importance "
+            "and should not be interpreted as causal dose-response relationships. "
+            "Bootstrap stability reduces, but does not eliminate, uncertainty arising "
+            "from limited sample size, predictor collinearity, and source heterogeneity.\n\n"
+            "Folder contents\n"
+            "---------------\n"
+            "robustness_summary.xlsx: combined results for all gas targets.\n"
+            "<target>/robustness_results.xlsx: complete target-specific tables.\n"
+            "<target>/main_effect_importance_stability.*: final-model importance and "
+            "bootstrap 95% intervals.\n"
+            "<target>/main_effect_curve_stability.*: final-model curves and bootstrap "
+            "95% uncertainty bands.\n"
+            "<target>/pairwise_selection_frequency.*: bootstrap selection frequencies "
+            "of continuous pairwise terms.\n"
+        )
+
+    print(f"\n  Robustness analysis saved to: {robustness_root}")
+
+
 def generate_manuscript_figures_v2(df: pd.DataFrame,
                                    models: List[GAMModelWrapper],
                                    output_dir: str,
@@ -2886,7 +3658,12 @@ def generate_manuscript_figures_v2(df: pd.DataFrame,
         y = target_data[target].to_numpy(dtype=float)
         model = model_template.clone()
         model.fit(X, y, target=target)
-        contexts[target] = {"X": X, "scaler": scaler}
+        contexts[target] = {
+            "X": X,
+            "scaler": scaler,
+            "model": model,
+            "data": target_data.copy(),
+        }
         feature_tables[target] = _get_term_importance_table(model, X)
         shape_tables[target] = _compute_main_effect_table(model, X, scaler, target)
         pdp_tables[target], ice_tables[target] = _compute_ice_pdp_tables(
@@ -2910,6 +3687,13 @@ def generate_manuscript_figures_v2(df: pd.DataFrame,
                          manuscript_dir, "FigS2_ice_pdp_biomass_characteristics")
     _plot_ice_pdp_matrix(pdp_tables, ice_tables, OPERATING_FEATURES,
                          manuscript_dir, "FigS3_ice_pdp_operating_parameters")
+
+    if CFG.RUN_INTERPRETABILITY_ROBUSTNESS:
+        run_interpretability_robustness_analysis(
+            contexts=contexts,
+            model_template=model_template,
+            output_dir=output_dir,
+        )
 
     readme = os.path.join(manuscript_dir, "README_manuscript_figures.txt")
     with open(readme, "w", encoding="utf-8") as handle:
